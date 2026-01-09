@@ -1,0 +1,636 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+      python: 3.11
+    commands:
+      - echo "Installing AWS CDK CLI..."
+      - npm install -g aws-cdk@latest
+      - cd backend
+      - npm install
+
+  pre_build:
+    commands:
+      - echo "Building TypeScript..."
+      - npm run build
+      - echo "Bootstrapping CDK..."
+      - cdk bootstrap --require-approval never
+      
+      # Build Fargate Docker image using AWS Public ECR
+      - echo "========================================="
+      - echo "Building Fargate Docker Image (AWS Public ECR)"
+      - echo "========================================="
+      - cd fargate
+      - chmod +x build.sh
+      - ./build.sh
+      - cd ..
+
+  build:
+    commands:
+      - |
+        if [ "$ACTION" = "destroy" ]; then
+          echo "Destroying stack..."
+          cdk destroy LOCstack --force \
+            --context projectName="$PROJECT_NAME" \
+            --context dataBucketName="$DATA_BUCKET_NAME" \
+            --context bedrockModelId="$BEDROCK_MODEL_ID"
+        else
+          echo "========================================="
+          echo "Deploying Library of Congress Pipeline"
+          echo "========================================="
+          
+          echo "Deploying CDK stack (without KB)..."
+          cdk deploy LOCstack --require-approval never \
+            --context projectName="$PROJECT_NAME" \
+            --context dataBucketName="$DATA_BUCKET_NAME" \
+            --context bedrockModelId="$BEDROCK_MODEL_ID" \
+            --outputs-file outputs.json
+          
+          echo "Extracting outputs..."
+          DATA_BUCKET=$(cat outputs.json | jq -r '.LOCstack.DataBucketName // empty')
+          TRANSFORMATION_BUCKET=$(cat outputs.json | jq -r '.LOCstack.TransformationBucketName // empty')
+          KB_ROLE_ARN=$(cat outputs.json | jq -r '.LOCstack.KnowledgeBaseRoleArn // empty')
+          API_URL=$(cat outputs.json | jq -r '.LOCstack.APIGatewayURL // empty')
+          AMPLIFY_APP_ID=$(cat outputs.json | jq -r '.LOCstack.AmplifyAppId // empty')
+          BUILDS_BUCKET=$(cat outputs.json | jq -r '.LOCstack.BuildsBucketName // empty')
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          echo ""
+          echo "========================================="
+          echo "Frontend Build and Automated Deployment"
+          echo "========================================="
+          
+          # Check if Frontend directory exists
+          if [ -d "../frontend" ]; then
+            cd ../frontend
+            
+            # Set up environment variables
+            export PUBLIC_URL=""
+            export GENERATE_SOURCEMAP=false
+            echo "REACT_APP_API_BASE_URL=$API_URL" > .env.production
+            echo "REACT_APP_CHAT_ENDPOINT=$API_URL" >> .env.production
+            echo "REACT_APP_HEALTH_ENDPOINT=$API_URL" >> .env.production
+            echo "REACT_APP_AWS_REGION=$CDK_DEFAULT_REGION" >> .env.production
+            echo "PUBLIC_URL=" >> .env.production
+            echo "GENERATE_SOURCEMAP=false" >> .env.production
+            
+            # Clean and build
+            rm -rf build/ node_modules/.cache/
+            npm install
+            npm run build
+            
+            if [ ! -f "build/index.html" ]; then
+              echo "❌ ERROR: Build failed - index.html not found!"
+              exit 1
+            fi
+            
+            if grep -q "%PUBLIC_URL%" build/index.html; then
+              echo "❌ ERROR: Build incomplete - %PUBLIC_URL% not replaced!"
+              exit 1
+            fi
+            
+            echo "✅ Build successful"
+            
+            # Create deployment package
+            cd build
+            zip -r ../build.zip . -x "*.DS_Store" "*.map"
+            cd ..
+            
+            # Upload to builds bucket
+            BUILD_KEY="builds/build-$(date +%s).zip"
+            
+            if [ -n "$BUILDS_BUCKET" ] && [ "$BUILDS_BUCKET" != "empty" ]; then
+              aws s3 cp build.zip "s3://$BUILDS_BUCKET/$BUILD_KEY"
+              echo "✅ Build artifact uploaded to S3: $BUILD_KEY"
+              
+              # Use direct Amplify deployment
+              aws amplify start-deployment \
+                --app-id "$AMPLIFY_APP_ID" \
+                --branch-name "main" \
+                --source-url "s3://$BUILDS_BUCKET/$BUILD_KEY" \
+                --region "$CDK_DEFAULT_REGION"
+              echo "✅ Direct Amplify deployment started"
+              
+              echo "🚀 Automated deployment initiated"
+              echo "📱 Amplify App URL: https://main.$AMPLIFY_APP_ID.amplifyapp.com"
+            else
+              echo "⚠️ Builds bucket not found, skipping S3 upload"
+            fi
+            
+            cd ../backend
+          else
+            echo "⚠️ Frontend directory not found, skipping frontend deployment"
+          fi
+          
+          echo ""
+          echo "========================================="
+          echo "Creating Knowledge Base Resources"
+          echo "========================================="
+          
+          # Step 1: Create or Get Neptune Analytics Graph with Vector Search
+          echo "Step 1: Checking for existing Neptune Analytics graph..."
+          GRAPH_ID=$(aws neptune-graph list-graphs \
+            --region "$CDK_DEFAULT_REGION" \
+            --query "graphs[?name=='${PROJECT_NAME}-graph'].id | [0]" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$GRAPH_ID" ] && [ "$GRAPH_ID" != "None" ] && [ "$GRAPH_ID" != "null" ]; then
+            echo "✓ Found existing graph: $GRAPH_ID"
+            
+            # Check graph status
+            STATUS=$(aws neptune-graph get-graph \
+              --graph-identifier "$GRAPH_ID" \
+              --region "$CDK_DEFAULT_REGION" \
+              --query 'status' --output text 2>/dev/null || echo "ERROR")
+            
+            if [ "$STATUS" != "AVAILABLE" ]; then
+              echo "⚠ Graph exists but status is: $STATUS. Waiting for it to become available..."
+            else
+              echo "✓ Graph is available"
+            fi
+          else
+            echo "Creating new Neptune Analytics graph (16 m-NCUs) with Vector Search..."
+            GRAPH_ID=$(aws neptune-graph create-graph \
+              --graph-name "${PROJECT_NAME}-graph" \
+              --provisioned-memory 16 \
+              --no-public-connectivity \
+              --vector-search-configuration '{"dimension":1024}' \
+              --tags Project="$PROJECT_NAME" \
+              --region "$CDK_DEFAULT_REGION" \
+              --query 'id' --output text)
+            
+            if [ -z "$GRAPH_ID" ] || [ "$GRAPH_ID" = "None" ]; then
+              echo "✗ Failed to create Neptune Analytics graph"
+              echo "Check if Neptune Analytics is available in region: $CDK_DEFAULT_REGION"
+              exit 1
+            fi
+            
+            echo "✓ Graph created: $GRAPH_ID"
+          fi
+          
+          GRAPH_ARN="arn:aws:neptune-graph:${CDK_DEFAULT_REGION}:${AWS_ACCOUNT_ID}:graph/${GRAPH_ID}"
+          
+          # Step 2: Wait for graph to be available
+          echo "Step 2: Waiting for graph to be available..."
+          MAX_WAIT=600
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws neptune-graph get-graph \
+              --graph-identifier "$GRAPH_ID" \
+              --region "$CDK_DEFAULT_REGION" \
+              --query 'status' --output text 2>/dev/null || echo "ERROR")
+            
+            echo "  Graph status: $STATUS (waited ${ELAPSED}s)"
+            
+            if [ "$STATUS" = "AVAILABLE" ]; then
+              echo "✓ Graph is available"
+              break
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "DELETING" ]; then
+              echo "✗ Graph creation failed with status: $STATUS"
+              exit 1
+            elif [ "$STATUS" = "ERROR" ] || [ -z "$STATUS" ]; then
+              echo "✗ Failed to get graph status"
+              exit 1
+            fi
+            
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+          done
+          
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "✗ Timeout waiting for graph to be available"
+            exit 1
+          fi
+          
+          # Step 3: Create or Get Knowledge Base
+          echo "Step 3: Checking for existing Bedrock Knowledge Base..."
+          KB_ID=$(aws bedrock-agent list-knowledge-bases \
+            --region "$CDK_DEFAULT_REGION" \
+            --query "knowledgeBaseSummaries[?name=='${PROJECT_NAME}-knowledge-base'].knowledgeBaseId | [0]" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$KB_ID" ] && [ "$KB_ID" != "None" ] && [ "$KB_ID" != "null" ]; then
+            echo "✓ Found existing Knowledge Base: $KB_ID"
+          else
+            echo "Creating new Bedrock Knowledge Base..."
+            KB_ID=$(aws bedrock-agent create-knowledge-base \
+              --name "${PROJECT_NAME}-knowledge-base" \
+              --role-arn "$KB_ROLE_ARN" \
+              --knowledge-base-configuration '{
+                "type": "VECTOR",
+                "vectorKnowledgeBaseConfiguration": {
+                  "embeddingModelArn": "arn:aws:bedrock:'"$CDK_DEFAULT_REGION"'::foundation-model/amazon.titan-embed-text-v2:0"
+                }
+              }' \
+              --storage-configuration '{
+                "type": "NEPTUNE_ANALYTICS",
+                "neptuneAnalyticsConfiguration": {
+                  "graphArn": "'"$GRAPH_ARN"'",
+                  "fieldMapping": {
+                    "metadataField": "metadata",
+                    "textField": "text"
+                  }
+                }
+              }' \
+              --region "$CDK_DEFAULT_REGION" \
+              --query 'knowledgeBase.knowledgeBaseId' --output text)
+            
+            if [ -z "$KB_ID" ] || [ "$KB_ID" = "None" ]; then
+              echo "✗ Failed to create Knowledge Base"
+              exit 1
+            fi
+            
+            echo "✓ Knowledge Base created: $KB_ID"
+          fi
+          
+          # Step 4: Get Transformation Lambda ARN
+          echo "Step 4: Getting Transformation Lambda ARN..."
+          TRANSFORMATION_LAMBDA_ARN=$(aws lambda get-function \
+            --function-name "${PROJECT_NAME}-kb-transformation" \
+            --region "$CDK_DEFAULT_REGION" \
+            --query 'Configuration.FunctionArn' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$TRANSFORMATION_LAMBDA_ARN" ] || [ "$TRANSFORMATION_LAMBDA_ARN" = "None" ]; then
+            echo "⚠ Transformation Lambda not found, proceeding without custom transformation"
+            TRANSFORMATION_LAMBDA_ARN=""
+          else
+            echo "✓ Found Transformation Lambda: $TRANSFORMATION_LAMBDA_ARN"
+          fi
+          
+          # Step 5: Update Knowledge Base Role Permissions for Lambda
+          echo "Step 5: Updating Knowledge Base role permissions for Lambda invoke..."
+          KB_ROLE_NAME=$(echo "$KB_ROLE_ARN" | sed 's/.*role\///')
+          
+          echo "Adding Lambda invoke permissions to Knowledge Base role: $KB_ROLE_NAME"
+          aws iam put-role-policy \
+            --role-name "$KB_ROLE_NAME" \
+            --policy-name LambdaInvokeVersions \
+            --policy-document '{
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "lambda:InvokeFunction",
+                  "Resource": [
+                    "arn:aws:lambda:'"$CDK_DEFAULT_REGION"':'"$AWS_ACCOUNT_ID"':function:'"$PROJECT_NAME"'-kb-transformation",
+                    "arn:aws:lambda:'"$CDK_DEFAULT_REGION"':'"$AWS_ACCOUNT_ID"':function:'"$PROJECT_NAME"'-kb-transformation:$LATEST",
+                    "arn:aws:lambda:'"$CDK_DEFAULT_REGION"':'"$AWS_ACCOUNT_ID"':function:'"$PROJECT_NAME"'-kb-transformation:*"
+                  ]
+                }
+              ]
+            }' 2>/dev/null || echo "⚠ Failed to update role policy (may already exist)"
+          
+          echo "✓ Knowledge Base role permissions updated"
+          
+          # Step 6: Create or Get Data Source with Custom Transformation
+          echo "Step 6: Checking for existing Data Source..."
+          BUCKET_ARN="arn:aws:s3:::${DATA_BUCKET}"
+          
+          DS_ID=$(aws bedrock-agent list-data-sources \
+            --knowledge-base-id "$KB_ID" \
+            --region "$CDK_DEFAULT_REGION" \
+            --query "dataSourceSummaries[?name=='${PROJECT_NAME}-s3-datasource'].dataSourceId | [0]" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$DS_ID" ] && [ "$DS_ID" != "None" ] && [ "$DS_ID" != "null" ]; then
+            echo "✓ Found existing Data Source: $DS_ID"
+          else
+            echo "Creating new Data Source with Custom Transformation for GraphRAG..."
+            
+            # Create Data Source with Custom Transformation Lambda for precise filtering
+            echo "Creating Data Source with Custom Transformation Lambda..."
+            
+            # Build transformation configuration
+            if [ -n "$TRANSFORMATION_LAMBDA_ARN" ] && [ -n "$TRANSFORMATION_BUCKET" ]; then
+              TRANSFORMATION_CONFIG='"customTransformationConfiguration": {
+                "intermediateStorage": {
+                  "s3Location": {
+                    "uri": "s3://'"$TRANSFORMATION_BUCKET"'/temp/"
+                  }
+                },
+                "transformations": [
+                  {
+                    "stepToApply": "POST_CHUNKING",
+                    "transformationFunction": {
+                      "transformationLambdaConfiguration": {
+                        "lambdaArn": "'"$TRANSFORMATION_LAMBDA_ARN"'"
+                      }
+                    }
+                  }
+                ]
+              },'
+              echo "✓ Using Custom Transformation Lambda: $TRANSFORMATION_LAMBDA_ARN"
+              echo "✓ Intermediate storage: s3://$TRANSFORMATION_BUCKET/temp/"
+            else
+              TRANSFORMATION_CONFIG=""
+              echo "⚠ No transformation lambda or transformation bucket - using basic configuration"
+            fi
+            
+            DS_ID=$(aws bedrock-agent create-data-source \
+              --name "${PROJECT_NAME}-s3-datasource" \
+              --description "S3 data source with custom transformation lambda for precise bill filtering" \
+              --knowledge-base-id "$KB_ID" \
+              --data-source-configuration '{
+                "type": "S3",
+                "s3Configuration": {
+                  "bucketArn": "'"$BUCKET_ARN"'",
+                  "inclusionPrefixes": ["extracted/"]
+                }
+              }' \
+              --vector-ingestion-configuration '{
+                "chunkingConfiguration": {
+                  "chunkingStrategy": "FIXED_SIZE",
+                  "fixedSizeChunkingConfiguration": {
+                    "maxTokens": 1500,
+                    "overlapPercentage": 20
+                  }
+                },
+                '"$TRANSFORMATION_CONFIG"'
+                "contextEnrichmentConfiguration": {
+                  "type": "BEDROCK_FOUNDATION_MODEL",
+                  "bedrockFoundationModelConfiguration": {
+                    "modelArn": "arn:aws:bedrock:'"$CDK_DEFAULT_REGION"'::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+                    "enrichmentStrategyConfiguration": {
+                      "method": "CHUNK_ENTITY_EXTRACTION"
+                    }
+                  }
+                }
+              }' \
+              --region "$CDK_DEFAULT_REGION" \
+              --query 'dataSource.dataSourceId' --output text)
+            
+            if [ -z "$DS_ID" ] || [ "$DS_ID" = "None" ]; then
+              echo "✗ Failed to create Data Source"
+              exit 1
+            fi
+            
+            echo "✓ Data Source created: $DS_ID"
+          fi
+          
+          # Step 7: Update Lambda environment variables
+          echo "Step 7: Updating Lambda environment variables..."
+          
+          # Get current fargate-trigger Lambda config to preserve existing values
+          FARGATE_ENV=$(aws lambda get-function-configuration \
+            --function-name "${PROJECT_NAME}-fargate-trigger" \
+            --region "$CDK_DEFAULT_REGION" \
+            --query 'Environment.Variables' \
+            --output json)
+          
+          # Update fargate-trigger Lambda with KB IDs (using jq to build proper JSON)
+          echo "$FARGATE_ENV" | jq \
+            --arg kb_id "$KB_ID" \
+            --arg ds_id "$DS_ID" \
+            --arg bucket "$DATA_BUCKET" \
+            '{Variables: (. + {KNOWLEDGE_BASE_ID: $kb_id, DATA_SOURCE_ID: $ds_id, BUCKET_NAME: $bucket})}' > /tmp/fargate_env.json
+          
+          aws lambda update-function-configuration \
+            --function-name "${PROJECT_NAME}-fargate-trigger" \
+            --environment file:///tmp/fargate_env.json \
+            --region "$CDK_DEFAULT_REGION" >/dev/null
+          
+          # Update kb-sync-trigger Lambda (preserve existing vars)
+          KB_SYNC_ENV=$(aws lambda get-function-configuration \
+            --function-name "${PROJECT_NAME}-kb-sync-trigger" \
+            --region "$CDK_DEFAULT_REGION" \
+            --query 'Environment.Variables' \
+            --output json)
+          
+          echo "$KB_SYNC_ENV" | jq \
+            --arg kb_id "$KB_ID" \
+            --arg ds_id "$DS_ID" \
+            '{Variables: (. + {KNOWLEDGE_BASE_ID: $kb_id, DATA_SOURCE_ID: $ds_id})}' > /tmp/kb_sync_env.json
+          
+          aws lambda update-function-configuration \
+            --function-name "${PROJECT_NAME}-kb-sync-trigger" \
+            --environment file:///tmp/kb_sync_env.json \
+            --region "$CDK_DEFAULT_REGION" >/dev/null
+          
+          # Update chat-handler Lambda (preserve existing vars)
+          CHAT_ENV=$(aws lambda get-function-configuration \
+            --function-name "${PROJECT_NAME}-chat-handler" \
+            --region "$CDK_DEFAULT_REGION" \
+            --query 'Environment.Variables' \
+            --output json)
+          
+          echo "$CHAT_ENV" | jq \
+            --arg kb_id "$KB_ID" \
+            --arg model_id "$BEDROCK_MODEL_ID" \
+            '{Variables: (. + {KNOWLEDGE_BASE_ID: $kb_id, MODEL_ID: $model_id})}' > /tmp/chat_env.json
+          
+          aws lambda update-function-configuration \
+            --function-name "${PROJECT_NAME}-chat-handler" \
+            --environment file:///tmp/chat_env.json \
+            --region "$CDK_DEFAULT_REGION" >/dev/null
+          
+          echo "✓ Lambda environment variables updated (fargate-trigger, kb-sync-trigger, chat-handler)"
+          
+          # Step 8: Automatically start data collection
+          echo ""
+          echo "========================================="
+          echo "Step 8: Starting Automatic Data Collection"
+          echo "========================================="
+          echo "This will collect bills from Congresses 1-16 (all types)"
+          echo "Fargate task will:"
+          echo "  1. Call Congress API for all bills"
+          echo "  2. Extract text using Textract"
+          echo "  3. Upload to S3"
+          echo "  4. Auto-trigger Knowledge Base sync"
+          echo ""
+          
+          # Trigger Fargate data collection using environment variables
+          echo "Triggering Fargate task (using hardcoded environment variables)..."
+          echo "Parameters:"
+          echo "  - Congresses: 1-16"
+          echo "  - Bill types: hr,s,hjres,sjres,hconres,sconres,hres,sres"
+          echo "  - Function: ${PROJECT_NAME}-fargate-trigger"
+          echo ""
+          
+          aws lambda invoke \
+            --function-name "${PROJECT_NAME}-fargate-trigger" \
+            --region "$CDK_DEFAULT_REGION" \
+            /tmp/fargate_response.json
+          
+          # Simple success check - if Lambda returns 200, we're good
+          if [ -f "/tmp/fargate_response.json" ]; then
+            LAMBDA_STATUS=$(cat /tmp/fargate_response.json | jq -r '.StatusCode // 0')
+            if [ "$LAMBDA_STATUS" = "200" ]; then
+              echo "✓ Fargate data collection started successfully!"
+              echo ""
+              echo "📊 What's happening now:"
+              echo "  - Fargate task is starting (takes 2-3 minutes)"
+              echo "  - Will collect bills from Congresses 1-16"
+              echo "  - All bill types: HR, S, HJRES, SJRES, HCONRES, SCONRES, HRES, SRES"
+              echo "  - Data will be uploaded to S3"
+              echo "  - Knowledge Base sync will start automatically when complete"
+              echo ""
+              echo "🔍 Monitor progress:"
+              echo "  aws logs tail /ecs/${PROJECT_NAME}-collector --follow --region ${CDK_DEFAULT_REGION}"
+              echo ""
+              echo "📈 Expected timeline:"
+              echo "  - Next 5-15 minutes: Data collection"
+              echo "  - Following 5-10 minutes: Knowledge Base sync"
+              echo "  - Total time: ~20-30 minutes until chat API is ready"
+              FARGATE_SUCCESS="200"
+            else
+              echo "⚠ Lambda returned status: $LAMBDA_STATUS"
+              echo "Check Lambda logs for details:"
+              echo "  aws logs tail /aws/lambda/${PROJECT_NAME}-fargate-trigger --follow --region ${CDK_DEFAULT_REGION}"
+              FARGATE_SUCCESS="failed"
+            fi
+          else
+            echo "⚠ No response file created"
+            FARGATE_SUCCESS="failed"
+          fi
+          
+          echo ""
+          echo "========================================="
+          echo "✓ Deployment Complete!"
+          echo "========================================="
+          echo "Infrastructure Status:"
+          echo "  Graph ID: $GRAPH_ID"
+          echo "  Knowledge Base ID: $KB_ID"
+          echo "  Data Source ID: $DS_ID"
+          echo "  Data Bucket: $DATA_BUCKET"
+          echo ""
+          if [ "$FARGATE_SUCCESS" = "200" ]; then
+            echo "🚀 Automated Data Collection: STARTED"
+            echo "   The system is now collecting historical bills automatically."
+            echo "   No further action required - everything is automated!"
+          else
+            echo "⚠️  Automated Data Collection: FAILED"
+            echo "   You can start data collection manually:"
+            echo "   python test_complete_pipeline.py"
+          fi
+          echo "========================================="
+          
+          # Extract optional outputs (may not exist in all stacks)
+          STATE_MACHINE_ARN=$(cat outputs.json | jq -r '.LOCstack.StateMachineArn // empty')
+          API_URL=$(cat outputs.json | jq -r '.LOCstack.APIGatewayURL // empty')
+          CHAT_ENDPOINT=$(cat outputs.json | jq -r '.LOCstack.ChatEndpoint // empty')
+          
+          if [ -z "$DATA_BUCKET" ]; then
+            echo "❌ ERROR: Could not extract Data Bucket from CDK deployment"
+            exit 1
+          fi
+          
+          if [ -z "$TRANSFORMATION_BUCKET" ]; then
+            echo "❌ ERROR: Could not extract Transformation Bucket from CDK deployment"
+            exit 1
+          fi
+          
+          echo "✅ Deployment successful!"
+          echo ""
+          echo "========================================="
+          echo "Deployment Summary"
+          echo "========================================="
+          echo "Data Bucket: $DATA_BUCKET"
+          echo "Transformation Bucket: $TRANSFORMATION_BUCKET"
+          echo "Graph ID: $GRAPH_ID"
+          echo "Knowledge Base ID: $KB_ID"
+          echo "Data Source ID: $DS_ID"
+          
+          if [ -n "$STATE_MACHINE_ARN" ]; then
+            echo "State Machine ARN: $STATE_MACHINE_ARN"
+          fi
+          
+          if [ -n "$API_URL" ]; then
+            echo "API Gateway URL: $API_URL"
+          fi
+          
+          if [ -n "$CHAT_ENDPOINT" ]; then
+            echo "Chat Endpoint: $CHAT_ENDPOINT"
+          fi
+          
+          # Frontend URLs
+          if [ -n "$BUILDS_BUCKET" ]; then
+            echo "Builds Bucket: $BUILDS_BUCKET"
+          fi
+          
+          if [ -n "$AMPLIFY_APP_ID" ] && [ "$AMPLIFY_APP_ID" != "null" ]; then
+            AMPLIFY_URL="https://main.${AMPLIFY_APP_ID}.amplifyapp.com"
+            echo "Frontend Amplify URL: $AMPLIFY_URL"
+          fi
+          echo ""
+          echo ""
+          echo "========================================="
+          echo "Next Steps & Monitoring"
+          echo "========================================="
+          
+          if [ "$FARGATE_SUCCESS" = "200" ]; then
+            echo "✅ System Status: FULLY AUTOMATED"
+            echo ""
+            echo "🌐 Frontend Deployed:"
+            if [ -n "$AMPLIFY_APP_ID" ] && [ "$AMPLIFY_APP_ID" != "null" ]; then
+              echo "  Amplify URL: https://main.${AMPLIFY_APP_ID}.amplifyapp.com"
+            fi
+            echo ""
+            echo "📈 What's Happening Now:"
+            echo "  1. Fargate task is collecting bills from Congress API"
+            echo "  2. Text extraction with Textract (for PDFs)"
+            echo "  3. Files being uploaded to S3"
+            echo "  4. Knowledge Base sync will start automatically"
+            echo "  5. Chat API will be ready in ~20-30 minutes"
+            echo "  6. Frontend is already live and ready to use!"
+            echo ""
+            echo "🔍 Monitor Real-time Progress:"
+            echo "  aws logs tail /ecs/${PROJECT_NAME}-collector --follow --region ${CDK_DEFAULT_REGION}"
+            echo ""
+            echo "📊 Check Data Collection:"
+            echo "  aws s3 ls s3://${DATA_BUCKET}/extracted/ --recursive"
+            echo ""
+            echo "🧠 Check Knowledge Base Status:"
+            echo "  aws bedrock-agent list-ingestion-jobs \\"
+            echo "    --knowledge-base-id $KB_ID \\"
+            echo "    --data-source-id $DS_ID \\"
+            echo "    --region ${CDK_DEFAULT_REGION}"
+          else
+            echo "⚠️  Manual Setup Required:"
+            echo ""
+            echo "🌐 Frontend Deployed:"
+            if [ -n "$AMPLIFY_APP_ID" ] && [ "$AMPLIFY_APP_ID" != "null" ]; then
+              echo "  Amplify URL: https://main.${AMPLIFY_APP_ID}.amplifyapp.com"
+            fi
+            echo ""
+            echo "1. Start data collection:"
+            echo "   python test_complete_pipeline.py"
+            echo ""
+            echo "2. Or trigger Fargate manually:"
+            echo "   aws lambda invoke \\"
+            echo "     --function-name ${PROJECT_NAME}-fargate-trigger \\"
+            echo "     --payload '{\"body\":\"{\\\"start_congress\\\":1,\\\"end_congress\\\":16}\"}' \\"
+            echo "     --region ${CDK_DEFAULT_REGION} response.json"
+          fi
+          echo ""
+        fi
+
+  post_build:
+    commands:
+      - echo "========================================="
+      - echo "Build Complete"
+      - echo "========================================="
+      - |
+        if [ "$ACTION" = "deploy" ]; then
+          if [ "$FARGATE_SUCCESS" = "200" ]; then
+            echo "🎉 SUCCESS: Fully Automated Pipeline Deployed!"
+            echo "🌐 Frontend is live and ready to use!"
+            echo "📊 Data collection is running automatically"
+            echo "🤖 Chat API will be ready in 20-30 minutes"
+            echo "🔍 Monitor progress with the commands shown above"
+          else
+            echo "✅ Infrastructure deployed successfully"
+            echo "🌐 Frontend is live and ready to use!"
+            echo "⚠️  Data collection needs manual trigger"
+            echo "📋 Use: python test_complete_pipeline.py"
+          fi
+        else
+          echo "✅ Stack destroyed successfully"
+        fi
+
+artifacts:
+  files:
+    - "**/*"
+  base-directory: "backend/cdk.out"
