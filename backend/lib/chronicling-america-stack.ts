@@ -14,6 +14,8 @@ import * as amplify from "aws-cdk-lib/aws-amplify";
 import * as s3deploy from "aws-cdk-lib/aws-s3-deployment";
 import { Construct } from "constructs";
 import * as path from "path";
+import { bedrock as bedrockConstructs } from "@cdklabs/generative-ai-cdk-constructs";
+import { ContextEnrichment } from "@cdklabs/generative-ai-cdk-constructs/lib/cdk-lib/bedrock";
 
 export interface ChroniclingAmericaStackProps extends cdk.StackProps {
   projectName: string;
@@ -45,21 +47,39 @@ export class ChroniclingAmericaStack extends cdk.Stack {
         `${projectName}-data-${this.account}-${this.region}`,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, // Delete bucket when stack is destroyed
+      autoDeleteObjects: true, // Automatically delete objects when bucket is destroyed
       eventBridgeEnabled: true, // Enable EventBridge for S3 events
     });
 
     // Transformation bucket for Knowledge Base intermediate storage
     const transformationBucket = new s3.Bucket(this, "TransformationBucket", {
-      bucketName: `loc-transformation-${this.account}-${this.region}`,
+      bucketName: `${projectName}-transformation-${this.account}-${this.region}`,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // Can be destroyed since it's just temp storage
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true, // Automatically delete objects when bucket is destroyed
       lifecycleRules: [
         {
           id: "DeleteTempFiles",
           enabled: true,
           expiration: cdk.Duration.days(7), // Auto-delete temp files after 7 days
+        },
+      ],
+    });
+
+    // Supplemental data storage bucket for Bedrock Data Automation
+    const supplementalBucket = new s3.Bucket(this, "SupplementalBucket", {
+      bucketName: `${projectName}-supp-${this.account}-${this.region}`,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: true, // Automatically delete objects when bucket is destroyed
+      lifecycleRules: [
+        {
+          id: "DeleteSupplementalFiles",
+          enabled: true,
+          expiration: cdk.Duration.days(30), // Keep supplemental data longer than temp files
         },
       ],
     });
@@ -102,11 +122,28 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       })
     );
 
-
-
-    // ========================================
-    // VPC for Fargate (minimal setup)
-    // ========================================
+    // Grant Bedrock service access to supplemental bucket (for Data Automation)
+    supplementalBucket.addToResourcePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal("bedrock.amazonaws.com")],
+        actions: [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+        ],
+        resources: [
+          supplementalBucket.bucketArn,
+          `${supplementalBucket.bucketArn}/*`,
+        ],
+        conditions: {
+          StringEquals: {
+            "aws:SourceAccount": this.account,
+          },
+        },
+      })
+    );
     const vpc = new ec2.Vpc(this, "VPC", {
       maxAzs: 2,
       natGateways: 0, // Use public subnets only for cost savings
@@ -135,7 +172,8 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       "CollectorRepository",
       {
         repositoryName: `${projectName}-collector`,
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
+        removalPolicy: cdk.RemovalPolicy.DESTROY, // Delete repository when stack is destroyed
+        emptyOnDelete: true, // Automatically delete images when repository is destroyed
         lifecycleRules: [
           {
             maxImageCount: 5,
@@ -162,6 +200,7 @@ export class ChroniclingAmericaStack extends cdk.Stack {
 
     // Grant S3 permissions to Fargate task
     dataBucket.grantReadWrite(fargateTaskRole);
+    supplementalBucket.grantReadWrite(fargateTaskRole);
 
     // Grant Bedrock permissions to Fargate task (for triggering KB sync)
     fargateTaskRole.addToPolicy(
@@ -171,12 +210,13 @@ export class ChroniclingAmericaStack extends cdk.Stack {
           "bedrock:StartIngestionJob",
           "bedrock:GetIngestionJob",
           "bedrock:ListIngestionJobs",
+          "bedrock:ListDataSources",  // Required to list all data sources before syncing
         ],
         resources: ["*"],
       })
     );
 
-    // Grant Amazon Textract permissions to Fargate task
+    // Grant Textract permissions to Fargate task (for PDF OCR)
     fargateTaskRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -186,6 +226,21 @@ export class ChroniclingAmericaStack extends cdk.Stack {
           "textract:GetDocumentTextDetection",
         ],
         resources: ["*"],
+      })
+    );
+
+    // Grant Bedrock Converse permissions (fallback for small PDFs)
+    fargateTaskRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+        ],
+        resources: [
+          `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0`,
+          `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
+        ],
       })
     );
 
@@ -222,16 +277,20 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       }),
       environment: {
         BUCKET_NAME: dataBucket.bucketName,
+        SUPPLEMENTAL_BUCKET_NAME: supplementalBucket.bucketName,
         BEDROCK_MODEL_ID: bedrockModelId,
+        AWS_REGION: this.region,
         // Congress Bills Configuration
         START_CONGRESS: "1",
         END_CONGRESS: "16",
         BILL_TYPES: "hr,s,hjres,sjres,hconres,sconres,hres,sres",
         CONGRESS_API_KEY: "MThtRT5WkFu8I8CHOfiLLebG4nsnKcX3JnNv2N8A",
-        // Chronicling America Newspapers Configuration
-        START_YEAR: "1760",
-        END_YEAR: "1820",
-        MAX_NEWSPAPER_PAGES: "10",
+        // Hugging Face Dataset Configuration for Newspapers
+        HUGGINGFACE_DATASET: "RevolutionCrossroads/loc_chronicling_america_1770-1810",
+        MAX_NEWSPAPER_PAGES: "0",  // 0 = process ALL newspapers (auto-creates batches of 25k)
+        // Use Bedrock Data Automation instead of Textract
+        USE_BEDROCK_PARSING: "true",
+        BILLS_PREFIX: "bills/", // Store raw bills here instead of extracted/
       },
     });
 
@@ -246,6 +305,7 @@ export class ChroniclingAmericaStack extends cdk.Stack {
     // Grant S3 permissions to Knowledge Base role
     dataBucket.grantRead(knowledgeBaseRole);
     transformationBucket.grantReadWrite(knowledgeBaseRole);
+    supplementalBucket.grantReadWrite(knowledgeBaseRole);
 
     // Grant Neptune Analytics permissions
     knowledgeBaseRole.addToPolicy(
@@ -283,73 +343,102 @@ export class ChroniclingAmericaStack extends cdk.Stack {
     );
 
     // ========================================
-    // Knowledge Base will be created via CLI in buildspec.yml
+    // Knowledge Base with GraphRAG (Neptune Analytics)
     // ========================================
+    const kb = new bedrockConstructs.GraphKnowledgeBase(this, "ChroniclingAmericaKB", {
+      name: `${projectName}-knowledge-base`,
+      description: "Knowledge base for historical Congressional bills (1789-1875) and Chronicling America newspapers (1770-1810) with GraphRAG using Neptune Analytics",
+      embeddingModel: bedrockConstructs.BedrockFoundationModel.TITAN_EMBED_TEXT_V2_1024,
+      instruction: `You are a historical research assistant specializing in U.S. Congressional bills from 1789-1875 and historical newspapers from 1770-1810.
 
-    // Placeholder values - will be updated by CLI after KB creation
-    const knowledgeBaseId = "PLACEHOLDER_KB_ID";
-    const dataSourceId = "PLACEHOLDER_DS_ID";
+CRITICAL RULES:
+1. ONLY answer questions using information found in the provided documents
+2. If the documents do not contain the answer, respond with: "I cannot find information about this in the available documents."
+3. DO NOT use your general knowledge or training data to answer questions
+4. DO NOT provide historical context that is not in the documents
+5. DO NOT make assumptions or inferences beyond what is explicitly stated in the documents
 
-    // ========================================
-    // CodeBuild Role for Neptune Analytics (for buildspec.yml)
-    // ========================================
-    const codeBuildRole = new iam.Role(this, "CodeBuildNeptuneRole", {
-      assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
-      description: "Role for CodeBuild to create Neptune Analytics resources",
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("AWSCodeBuildDeveloperAccess"),
-      ],
+When answering:
+- Cite specific bills, newspapers, or documents
+- Include dates and sources from the documents
+- If information is partial, state what you found and what is missing
+- Always prioritize document accuracy over completeness
+
+Focus on delivering precise historical information with proper citations from the documents only.`,
+      existingRole: knowledgeBaseRole,
     });
 
-    // Grant Neptune Analytics permissions to CodeBuild
-    codeBuildRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "neptune-graph:CreateGraph",
-          "neptune-graph:DeleteGraph",
-          "neptune-graph:GetGraph",
-          "neptune-graph:ListGraphs",
-          "neptune-graph:UpdateGraph",
-          "neptune-graph:CreateGraphSnapshot",
-          "neptune-graph:DeleteGraphSnapshot",
-          "neptune-graph:ListGraphSnapshots",
-          "neptune-graph:RestoreGraphFromSnapshot",
-          "neptune-graph:TagResource",
-          "neptune-graph:UntagResource"
-        ],
-        resources: ["*"],
-      })
-    );
+    // ========================================
+    // S3 Data Sources (4 total: 1 for bills, 3 for newspapers)
+    // ========================================
+    
+    // Data Source 1: Congress Bills
+    new bedrockConstructs.S3DataSource(this, "BillsDataSource", {
+      bucket: dataBucket,
+      knowledgeBase: kb,
+      dataSourceName: "congress-bills",
+      description: "Congressional bills from Congress 1-16 (1789-1875)",
+      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
+        maxTokens: 1500,
+        overlapPercentage: 20,
+      }),
+      contextEnrichment: ContextEnrichment.foundationModel({
+        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
+      }),
+      inclusionPrefixes: ["bills/"], // All files in bills/ folder
+    });
 
-    // Grant Bedrock Agent permissions for Knowledge Base creation
-    codeBuildRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "bedrock:CreateKnowledgeBase",
-          "bedrock:DeleteKnowledgeBase",
-          "bedrock:GetKnowledgeBase",
-          "bedrock:ListKnowledgeBases",
-          "bedrock:UpdateKnowledgeBase",
-          "bedrock-agent:CreateDataSource",
-          "bedrock-agent:DeleteDataSource",
-          "bedrock-agent:GetDataSource",
-          "bedrock-agent:ListDataSources",
-          "bedrock-agent:UpdateDataSource"
-        ],
-        resources: ["*"],
-      })
-    );
+    // Data Source 2: Newspapers Batch 1 (0-25,000 pages)
+    new bedrockConstructs.S3DataSource(this, "NewspapersBatch1DataSource", {
+      bucket: dataBucket,
+      knowledgeBase: kb,
+      dataSourceName: "newspapers-batch-1",
+      description: "Chronicling America newspapers 1770-1810 (Batch 1: pages 0-25,000)",
+      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
+        maxTokens: 1500,
+        overlapPercentage: 20,
+      }),
+      contextEnrichment: ContextEnrichment.foundationModel({
+        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
+      }),
+      inclusionPrefixes: ["newspapers/batch-1/"],
+    });
 
-    // Grant IAM PassRole for Knowledge Base role
-    codeBuildRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ["iam:PassRole"],
-        resources: [knowledgeBaseRole.roleArn],
-      })
-    );
+    // Data Source 3: Newspapers Batch 2 (25,001-50,000 pages)
+    new bedrockConstructs.S3DataSource(this, "NewspapersBatch2DataSource", {
+      bucket: dataBucket,
+      knowledgeBase: kb,
+      dataSourceName: "newspapers-batch-2",
+      description: "Chronicling America newspapers 1770-1810 (Batch 2: pages 25,001-50,000)",
+      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
+        maxTokens: 1500,
+        overlapPercentage: 20,
+      }),
+      contextEnrichment: ContextEnrichment.foundationModel({
+        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
+      }),
+      inclusionPrefixes: ["newspapers/batch-2/"],
+    });
+
+    // Data Source 4: Newspapers Batch 3 (50,001-58,000 pages)
+    new bedrockConstructs.S3DataSource(this, "NewspapersBatch3DataSource", {
+      bucket: dataBucket,
+      knowledgeBase: kb,
+      dataSourceName: "newspapers-batch-3",
+      description: "Chronicling America newspapers 1770-1810 (Batch 3: pages 50,001-58,000)",
+      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
+        maxTokens: 1500,
+        overlapPercentage: 20,
+      }),
+      contextEnrichment: ContextEnrichment.foundationModel({
+        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
+      }),
+      inclusionPrefixes: ["newspapers/batch-3/"],
+    });
+
+    const knowledgeBaseId = kb.knowledgeBaseId;
+    // Note: All 4 data sources are automatically associated with the KB
+    // Each data source handles up to 25,000 pages (Bedrock limit)
 
     // ========================================
     // Lambda Execution Role
@@ -473,8 +562,11 @@ export class ChroniclingAmericaStack extends cdk.Stack {
           START_CONGRESS: "1",
           END_CONGRESS: "16",
           BILL_TYPES: "hr,s,hjres,sjres,hconres,sconres,hres,sres",
+          HUGGINGFACE_DATASET: "RevolutionCrossroads/loc_chronicling_america_1770-1810",
+          MAX_NEWSPAPER_PAGES: "58000",
           KNOWLEDGE_BASE_ID: knowledgeBaseId,
-          DATA_SOURCE_ID: dataSourceId,
+          // DATA_SOURCE_ID will be queried at runtime from Knowledge Base
+          BILLS_PREFIX: "bills/", // Updated for Bedrock Data Automation
         },
         logGroup: fargateTriggerLogGroup,
       }
@@ -506,7 +598,7 @@ export class ChroniclingAmericaStack extends cdk.Stack {
         role: lambdaRole,
         environment: {
           KNOWLEDGE_BASE_ID: knowledgeBaseId,
-          DATA_SOURCE_ID: dataSourceId,
+          // DATA_SOURCE_ID will be queried at runtime from Knowledge Base
         },
         logGroup: kbSyncTriggerLogGroup,
       }
@@ -675,19 +767,19 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       platform: "WEB",
       environmentVariables: [
         {
-          name: "REACT_APP_API_BASE_URL",
+          name: "NEXT_PUBLIC_API_BASE_URL",
           value: api.url,
         },
         {
-          name: "REACT_APP_CHAT_ENDPOINT", 
+          name: "NEXT_PUBLIC_CHAT_ENDPOINT", 
           value: api.url,
         },
         {
-          name: "REACT_APP_HEALTH_ENDPOINT",
+          name: "NEXT_PUBLIC_HEALTH_ENDPOINT",
           value: api.url,
         },
         {
-          name: "REACT_APP_AWS_REGION",
+          name: "NEXT_PUBLIC_AWS_REGION",
           value: this.region,
         },
         {
@@ -705,11 +797,27 @@ export class ChroniclingAmericaStack extends cdk.Stack {
               name: "Node.js version",
               pkg: "node",
               type: "nvm",
-              version: "18",
+              version: "20",
             },
           ]),
         },
       ],
+      buildSpec: `version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: out
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*`,
       customRules: [
         {
           source: "/<*>",
@@ -727,19 +835,19 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       enableAutoBuild: false, // We'll trigger builds via CodeBuild
       environmentVariables: [
         {
-          name: "REACT_APP_API_BASE_URL",
+          name: "NEXT_PUBLIC_API_BASE_URL",
           value: api.url,
         },
         {
-          name: "REACT_APP_CHAT_ENDPOINT",
+          name: "NEXT_PUBLIC_CHAT_ENDPOINT",
           value: api.url,
         },
         {
-          name: "REACT_APP_HEALTH_ENDPOINT", 
+          name: "NEXT_PUBLIC_HEALTH_ENDPOINT", 
           value: api.url,
         },
         {
-          name: "REACT_APP_AWS_REGION",
+          name: "NEXT_PUBLIC_AWS_REGION",
           value: this.region,
         },
       ],
@@ -760,12 +868,16 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       exportName: `${projectName}-transformation-bucket`,
     });
 
+    new cdk.CfnOutput(this, "SupplementalBucketName", {
+      value: supplementalBucket.bucketName,
+      description: "S3 bucket for Bedrock Data Automation supplemental data storage",
+      exportName: `${projectName}-supplemental-bucket`,
+    });
 
-
-    new cdk.CfnOutput(this, "KnowledgeBaseRoleArn", {
-      value: knowledgeBaseRole.roleArn,
-      description: "IAM role ARN for Bedrock Knowledge Base",
-      exportName: `${projectName}-kb-role`,
+    new cdk.CfnOutput(this, "KnowledgeBaseId", {
+      value: kb.knowledgeBaseId,
+      description: "Bedrock Knowledge Base ID with GraphRAG (Neptune Analytics)",
+      exportName: `${projectName}-kb-id`,
     });
 
     new cdk.CfnOutput(this, "APIGatewayURL", {
@@ -796,9 +908,14 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       exportName: `${projectName}-fargate-task`,
     });
 
-    new cdk.CfnOutput(this, "ExtractedDataPrefix", {
-      value: `s3://${dataBucket.bucketName}/extracted/`,
-      description: "S3 prefix where Fargate saves extracted bill text",
+    new cdk.CfnOutput(this, "DataSourcePrefixes", {
+      value: JSON.stringify({
+        bills: `s3://${dataBucket.bucketName}/bills/`,
+        newspapers_batch1: `s3://${dataBucket.bucketName}/newspapers/batch-1/`,
+        newspapers_batch2: `s3://${dataBucket.bucketName}/newspapers/batch-2/`,
+        newspapers_batch3: `s3://${dataBucket.bucketName}/newspapers/batch-3/`,
+      }),
+      description: "S3 prefixes for all 4 data sources (1 bills + 3 newspaper batches)",
     });
 
     new cdk.CfnOutput(this, "BedrockModelId", {
@@ -810,62 +927,6 @@ export class ChroniclingAmericaStack extends cdk.Stack {
       value: kbTransformationFunction.functionArn,
       description: "Transformation Lambda ARN for Knowledge Base GraphRAG",
       exportName: `${projectName}-kb-transformation-arn`,
-    });
-
-    new cdk.CfnOutput(this, "CodeBuildNeptuneRoleArn", {
-      value: codeBuildRole.roleArn,
-      description: "CodeBuild role ARN with Neptune Analytics permissions",
-      exportName: `${projectName}-codebuild-neptune-role`,
-    });
-
-    // ========================================
-    // IAM Policy for Existing CodeBuild Role
-    // ========================================
-    // Create a managed policy that can be attached to your existing CodeBuild role
-    const neptuneBedrockPolicy = new iam.ManagedPolicy(this, "NeptuneBedrockPolicy", {
-      managedPolicyName: `${projectName}-neptune-bedrock-policy`,
-      description: "Policy for CodeBuild to create Neptune Analytics and Bedrock resources",
-      statements: [
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: [
-            "neptune-graph:CreateGraph",
-            "neptune-graph:DeleteGraph",
-            "neptune-graph:GetGraph",
-            "neptune-graph:ListGraphs",
-            "neptune-graph:UpdateGraph",
-            "neptune-graph:TagResource",
-            "neptune-graph:UntagResource"
-          ],
-          resources: ["*"],
-        }),
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: [
-            "bedrock:CreateKnowledgeBase",
-            "bedrock:DeleteKnowledgeBase",
-            "bedrock:GetKnowledgeBase",
-            "bedrock:ListKnowledgeBases",
-            "bedrock:UpdateKnowledgeBase",
-            "bedrock-agent:CreateDataSource",
-            "bedrock-agent:DeleteDataSource",
-            "bedrock-agent:GetDataSource",
-            "bedrock-agent:ListDataSources",
-            "bedrock-agent:UpdateDataSource"
-          ],
-          resources: ["*"],
-        }),
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: ["iam:PassRole"],
-          resources: [knowledgeBaseRole.roleArn],
-        }),
-      ],
-    });
-
-    new cdk.CfnOutput(this, "NeptuneBedrockPolicyArn", {
-      value: neptuneBedrockPolicy.managedPolicyArn,
-      description: "Managed policy ARN to attach to your existing CodeBuild role",
     });
 
     // ========================================

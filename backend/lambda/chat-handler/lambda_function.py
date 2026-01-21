@@ -268,7 +268,6 @@ def build_metadata_filter(bill_info: dict) -> dict:
 def query_knowledge_base(question: str, persona: str = 'general') -> dict:
     """
     Query Knowledge Base - handles both specific bill queries and general questions
-    WORKAROUND: Use raw retrieve + direct model invocation due to retrieve_and_generate citation bug
     """
     print(f"Querying Knowledge Base: {KNOWLEDGE_BASE_ID}")
     
@@ -276,18 +275,29 @@ def query_knowledge_base(question: str, persona: str = 'general') -> dict:
     bill_info = extract_bill_info(question)
     
     # Get AWS context
-    aws_region = os.environ.get("AWS_REGION", "us-west-2")
+    aws_region = os.environ.get("AWS_REGION", "us-east-1")
+    sts_client = boto3.client('sts')
+    account_id = sts_client.get_caller_identity()['Account']
     
     try:
+        # Determine model ARN
+        if BEDROCK_MODEL_ID.startswith(('us.', 'eu.', 'global.')):
+            model_arn = f'arn:aws:bedrock:{aws_region}:{account_id}:inference-profile/{BEDROCK_MODEL_ID}'
+        else:
+            model_arn = f'arn:aws:bedrock:{aws_region}::foundation-model/{BEDROCK_MODEL_ID}'
+        
+        # Get persona-specific system prompt
+        system_prompt = get_persona_prompt(persona)
+        
         # Build retrieval configuration
         retrieval_config = {
             'vectorSearchConfiguration': {
-                'numberOfResults': 10,
+                'numberOfResults': 50,
                 'overrideSearchType': 'SEMANTIC'
             }
         }
         
-        # Add metadata filter if specific bill is detected
+        # Add metadata filter only if specific bill is detected
         metadata_filter = build_metadata_filter(bill_info)
         if metadata_filter:
             retrieval_config['vectorSearchConfiguration']['filter'] = metadata_filter
@@ -295,127 +305,95 @@ def query_knowledge_base(question: str, persona: str = 'general') -> dict:
         else:
             print("General query - searching all documents")
         
-        # WORKAROUND: Use raw retrieve API (which works properly)
-        print(f"Using raw retrieve API due to retrieve_and_generate citation bug...")
-        
-        raw_response = bedrock_agent_runtime.retrieve(
-            knowledgeBaseId=KNOWLEDGE_BASE_ID,
-            retrievalQuery={'text': question},
-            retrievalConfiguration=retrieval_config
-        )
-        
-        print(f"Raw retrieve found {len(raw_response.get('retrievalResults', []))} results")
-        
-        # Extract retrieved documents
-        retrieved_docs = []
-        sources = []
-        
-        for i, result in enumerate(raw_response.get('retrievalResults', [])):
-            content = result.get('content', {}).get('text', '')
-            s3_uri = result.get('location', {}).get('s3Location', {}).get('uri', '')
-            metadata = result.get('metadata', {})
-            score = result.get('score', 0)
-            
-            if content and s3_uri:
-                retrieved_docs.append(content)
-                
-                # Create source for frontend
-                title = metadata.get('title', '')
-                if not title and s3_uri:
-                    filename = s3_uri.split('/')[-1]
-                    title = filename.replace('.pdf', '').replace('.txt', '').replace('_', ' ').replace('-', ' ')
-                    title = ' '.join(word.capitalize() for word in title.split())
-                
-                # Add congress info to title if available
-                if metadata.get('congress'):
-                    congress_info = f"Congress {metadata.get('congress')}"
-                    if metadata.get('bill_type') and metadata.get('bill_number'):
-                        bill_info_str = f"{metadata.get('bill_type')} {metadata.get('bill_number')}"
-                        title = f"{bill_info_str} - {congress_info}"
-                    elif not title or title == 'Congressional Document':
-                        title = congress_info
-                
-                # Generate presigned URL
-                presigned_url = s3_uri
-                if s3_uri.startswith('s3://'):
-                    try:
-                        s3_parts = s3_uri.replace('s3://', '').split('/', 1)
-                        if len(s3_parts) == 2:
-                            bucket_name, object_key = s3_parts
-                            s3_client = boto3.client('s3')
-                            presigned_url = s3_client.generate_presigned_url(
-                                'get_object',
-                                Params={'Bucket': bucket_name, 'Key': object_key},
-                                ExpiresIn=3600
-                            )
-                    except Exception as e:
-                        print(f"Error generating presigned URL: {e}")
-                
-                sources.append({
-                    'url': presigned_url,
-                    'title': title or 'Congressional Document',
-                    'type': 'pdf' if s3_uri.endswith('.pdf') else 'text',
-                    'score': score,
-                    'metadata': metadata
-                })
-        
-        if not retrieved_docs:
-            return {
-                'answer': "I couldn't find any relevant documents to answer your question. Please try rephrasing or ask about a different topic.",
-                'sources': [],
-                'entities': []
-            }
-        
-        # Now use direct model invocation with retrieved context
-        print(f"Invoking model directly with {len(retrieved_docs)} retrieved documents...")
-        
-        bedrock_runtime = boto3.client('bedrock-runtime', region_name=aws_region)
-        
-        # Get persona-specific system prompt
-        system_prompt = get_persona_prompt(persona)
-        
-        # Build context from retrieved documents
-        context = "\n\n".join([f"Document {i+1}:\n{doc}" for i, doc in enumerate(retrieved_docs[:5])])  # Limit to top 5
-        
-        # Build prompt
-        prompt = f"""{system_prompt}
+        # Build the configuration
+        retrieve_and_generate_config = {
+            'type': 'KNOWLEDGE_BASE',
+            'knowledgeBaseConfiguration': {
+                'knowledgeBaseId': KNOWLEDGE_BASE_ID,
+                'modelArn': model_arn,
+                'generationConfiguration': {
+                    'promptTemplate': {
+                        'textPromptTemplate': f"""{system_prompt}
 
-Use the following context to answer the question. Provide a well-formatted response with proper citations.
+Use the following context to answer the question. Provide a well-formatted response.
 
 Context:
-{context}
+$search_results$
 
-Question: {question}
+Question: $query$
 
 Answer:"""
-        
-        # Use Claude 3.5 Sonnet (foundation model)
-        model_id = 'anthropic.claude-3-5-sonnet-20241022-v2:0'
-        
-        response = bedrock_runtime.invoke_model(
-            modelId=model_id,
-            body=json.dumps({
-                "anthropic_version": "bedrock-2023-05-31",
-                "max_tokens": 2000,
-                "temperature": 0.1,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt
+                    },
+                    'inferenceConfig': {
+                        'textInferenceConfig': {
+                            'temperature': 0.1,
+                            'maxTokens': 2000
+                        }
                     }
-                ]
-            })
+                },
+                'retrievalConfiguration': retrieval_config
+            }
+        }
+        
+        # Query Knowledge Base
+        print(f"Calling retrieve_and_generate with config: {json.dumps(retrieve_and_generate_config, indent=2)}")
+        
+        response = bedrock_agent_runtime.retrieve_and_generate(
+            input={'text': question},
+            retrieveAndGenerateConfiguration=retrieve_and_generate_config
         )
         
-        response_body = json.loads(response['body'].read())
-        answer = response_body['content'][0]['text']
+        print(f"Raw Knowledge Base response: {json.dumps(response, indent=2, default=str)}")
         
-        print(f"✓ Generated answer with {len(sources)} sources using direct model invocation")
+        # Extract answer and sources
+        answer = response['output']['text']
+        print(f"Extracted answer: {answer}")
+        
+        sources = []
+        
+        if 'citations' in response:
+            print(f"Found {len(response['citations'])} citations")
+            for i, citation in enumerate(response['citations']):
+                print(f"Citation {i}: {json.dumps(citation, indent=2, default=str)}")
+                retrieved_refs = citation.get('retrievedReferences', [])
+                for j, reference in enumerate(retrieved_refs):
+                    print(f"  Reference {j}: {json.dumps(reference, indent=2, default=str)}")
+                    source_info = {
+                        'document_id': reference.get('location', {}).get('s3Location', {}).get('uri', ''),
+                        'content': reference.get('content', {}).get('text', '')[:200] + '...',
+                        'score': reference.get('score', 0),
+                        'title': reference.get('metadata', {}).get('title', ''),
+                        'url': reference.get('location', {}).get('s3Location', {}).get('uri', '')
+                    }
+                    sources.append(source_info)
+                    print(f"  Processed source: {source_info}")
+        else:
+            print("No citations found in response")
+        
+        # PREVENT HALLUCINATION: If no sources found, return appropriate message
+        if len(sources) == 0:
+            print("⚠️ WARNING: No sources found - Knowledge Base may be empty or not synced")
+            return {
+                'answer': "I don't have access to the historical documents yet. The Knowledge Base may still be syncing or needs to be populated with data. Please try again later or contact support.",
+                'sources': [],
+                'entities': [],
+                'warning': 'no_sources_found'
+            }
+        
+        # Extract entities
+        entities = []
+        if 'metadata' in response:
+            entities = response['metadata'].get('entities', [])
+            print(f"Found {len(entities)} entities: {entities}")
+        else:
+            print("No metadata found in response")
+        
+        print(f"✓ Knowledge Base returned answer with {len(sources)} sources and {len(entities)} entities")
         
         return {
             'answer': answer,
             'sources': sources,
-            'entities': []  # Could extract entities from metadata if needed
+            'entities': entities
         }
         
     except Exception as e:

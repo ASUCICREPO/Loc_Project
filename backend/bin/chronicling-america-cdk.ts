@@ -7,11 +7,10 @@ const app = new cdk.App();
 
 // Get context parameters
 const projectName =
-  app.node.tryGetContext("projectName") || "chronicling-america-pipeline";
+  app.node.tryGetContext("projectName")|| process.env.PROJECT_NAME;
 const dataBucketName = app.node.tryGetContext("dataBucketName");
 const bedrockModelId =
-  app.node.tryGetContext("bedrockModelId") ||
-  "anthropic.claude-3-5-sonnet-20241022-v2:0";
+  app.node.tryGetContext("bedrockModelId") || process.env.BEDROCK_MODEL_ID;
 
 new ChroniclingAmericaStack(app, "LOCstack", {
   projectName,

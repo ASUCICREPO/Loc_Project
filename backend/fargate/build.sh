@@ -26,16 +26,35 @@ for STACK_NAME in "LOCstack" "ChroniclingAmericaStackV2" "ChroniclingAmericaStac
     --query 'Stacks[0].Outputs[?OutputKey==`ECRRepositoryUri`].OutputValue' \
     --output text 2>/dev/null | cut -d'/' -f2)
   
-  if [ -n "$ECR_REPOSITORY" ]; then
+  if [ -n "$ECR_REPOSITORY" ] && [ "$ECR_REPOSITORY" != "None" ] && [ "$ECR_REPOSITORY" != "null" ]; then
     echo "✓ Found repository from stack: $STACK_NAME"
     break
+  else
+    ECR_REPOSITORY=""
   fi
 done
 
 # Fallback to default if not found
 if [ -z "$ECR_REPOSITORY" ]; then
-  ECR_REPOSITORY="loc-testing-collector"
+  # Use project name from environment (should match CDK context)
+  PROJECT_NAME=${PROJECT_NAME:-loc}
+  ECR_REPOSITORY="${PROJECT_NAME}-collector"
   echo "⚠ Could not auto-detect repository name, using default: $ECR_REPOSITORY"
+  echo "   PROJECT_NAME: $PROJECT_NAME"
+  echo "   Expected CDK repository name: ${PROJECT_NAME}-collector"
+fi
+
+# Validate repository name meets ECR requirements
+if [[ ! "$ECR_REPOSITORY" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+  echo "❌ ERROR: Repository name '$ECR_REPOSITORY' doesn't meet ECR naming requirements"
+  echo "   ECR repository names must:"
+  echo "   - Be lowercase"
+  echo "   - Contain only letters, numbers, hyphens, underscores, and periods"
+  echo "   - Not start or end with special characters"
+  echo ""
+  # Fix the repository name
+  ECR_REPOSITORY=$(echo "$ECR_REPOSITORY" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]//g' | sed 's/^[._-]*//g' | sed 's/[._-]*$//g')
+  echo "   Fixed repository name: $ECR_REPOSITORY"
 fi
 
 IMAGE_TAG=${IMAGE_TAG:-latest}

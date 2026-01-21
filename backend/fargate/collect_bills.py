@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Fargate Task: Multi-Source Data Collector with Textract
+Fargate Task: Multi-Source Data Collector
 Fetches data from:
-1. Congress API (bills from Congress 1-16)
-2. Chronicling America (newspapers 1760-1820)
-Uses Amazon Textract for text extraction from PDFs and images
+1. Congress API (bills from Congress 1-16) - Uses Textract for PDF extraction
+2. Hugging Face Dataset (newspapers 1770-1810) - Uses pre-extracted OCR text
 """
 
 import os
@@ -15,6 +14,7 @@ import boto3
 import requests
 from datetime import datetime
 from typing import List, Dict, Any
+from datasets import load_dataset
 
 # Configuration
 CONGRESS_API_KEY = os.environ.get('CONGRESS_API_KEY', 'MThtRT5WkFu8I8CHOfiLLebG4nsnKcX3JnNv2N8A')
@@ -25,10 +25,9 @@ START_CONGRESS = int(os.environ.get('START_CONGRESS', '1'))
 END_CONGRESS = int(os.environ.get('END_CONGRESS', '16'))
 BILL_TYPES = os.environ.get('BILL_TYPES', 'hr,s,hjres,sjres,hconres,sconres,hres,sres').split(',')
 
-# Chronicling America configuration
-START_YEAR = int(os.environ.get('START_YEAR', '1760'))
-END_YEAR = int(os.environ.get('END_YEAR', '1820'))
-MAX_NEWSPAPER_PAGES = int(os.environ.get('MAX_NEWSPAPER_PAGES', '1000'))
+# Hugging Face Dataset configuration for newspapers
+HUGGINGFACE_DATASET = os.environ.get('HUGGINGFACE_DATASET', 'RevolutionCrossroads/loc_chronicling_america_1770-1810')
+MAX_NEWSPAPER_PAGES = int(os.environ.get('MAX_NEWSPAPER_PAGES', '0'))  # 0 = process ALL newspapers, or set a limit
 
 # AWS clients
 s3 = boto3.client('s3')
@@ -39,15 +38,24 @@ class DataCollector:
         self.total_items = 0
         self.successful = 0
         self.failed = 0
+        self.skipped = 0
         self.errors = []
-        self.congress_stats = {'total': 0, 'successful': 0, 'failed': 0}
-        self.newspaper_stats = {'total': 0, 'successful': 0, 'failed': 0}
+        self.congress_stats = {'total': 0, 'successful': 0, 'failed': 0, 'skipped': 0}
+        self.newspaper_stats = {'total': 0, 'successful': 0, 'failed': 0, 'skipped': 0}
     
     def log(self, message):
         """Log with timestamp"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"[{timestamp}] {message}")
         sys.stdout.flush()
+    
+    def file_exists_in_s3(self, key: str) -> bool:
+        """Check if a file already exists in S3"""
+        try:
+            s3.head_object(Bucket=BUCKET_NAME, Key=key)
+            return True
+        except:
+            return False
     
     def extract_text_with_textract(self, pdf_url: str, doc_id: str) -> str:
         """
@@ -288,7 +296,11 @@ class DataCollector:
             self.log(f"  Cleanup warning: {e}")
     
     def get_bill_text(self, congress_num, bill_type, bill_number):
-        """Get bill text from Congress API"""
+        """
+        Get bill text from Congress API
+        Returns: tuple (text_content, document_url) or (None, None)
+        document_url is the actual PDF/XML/TXT URL from the API for citation
+        """
         try:
             # Get text versions
             text_url = f"https://api.congress.gov/v3/bill/{congress_num}/{bill_type}/{bill_number}/text"
@@ -303,17 +315,17 @@ class DataCollector:
             # Handle API errors gracefully
             if response.status_code == 500:
                 self.log(f"  ⚠️  Congress API returned 500 error (bill may not have text)")
-                return None
+                return None, None
             elif response.status_code == 404:
                 self.log(f"  ⚠️  Bill text not found (404)")
-                return None
+                return None, None
             
             response.raise_for_status()
             data = response.json()
             
             if 'textVersions' not in data or not data['textVersions']:
                 self.log(f"  ⚠️  No text versions available")
-                return None
+                return None, None
             
             # Get the first (latest) text version
             text_version = data['textVersions'][0]
@@ -321,54 +333,59 @@ class DataCollector:
             
             if not formats:
                 self.log(f"  ⚠️  No formats available")
-                return None
+                return None, None
             
             # Priority: Plain Text > PDF (with Textract)
+            # Save the actual document URL from API for citation
+            document_url = None
             pdf_url = None
             
             # Try Plain Text first
             for fmt in formats:
                 if fmt.get('type') == 'Plain Text':
+                    document_url = fmt.get('url', '')  # Actual text file URL from API
                     try:
-                        self.log(f"  Downloading plain text")
-                        response = requests.get(fmt['url'], headers=headers, timeout=30)
+                        self.log(f"  Downloading plain text from: {document_url}")
+                        response = requests.get(document_url, headers=headers, timeout=30)
                         response.raise_for_status()
                         text = response.text
                         # Verify it's actually text, not HTML
                         if '<html' in text.lower() or '<!doctype' in text.lower():
                             self.log(f"  ⚠️  Plain text is actually HTML, skipping")
                             continue
-                        return text
+                        return text, document_url
                     except Exception as e:
                         self.log(f"  ⚠️  Plain text download failed: {e}")
             
             # Try PDF with Textract
             for fmt in formats:
                 if fmt.get('type') == 'PDF':
-                    pdf_url = fmt['url']
+                    pdf_url = fmt.get('url', '')
+                    document_url = pdf_url  # Actual PDF URL from API
                     break
             
-            if pdf_url:
+            if pdf_url and document_url:
+                self.log(f"  Using PDF from: {document_url}")
                 doc_id = f"congress_{congress_num}_{bill_type}_{bill_number}"
                 text_content = self.extract_text_with_textract(pdf_url, doc_id)
                 if text_content:
-                    return text_content
+                    return text_content, document_url
             
             self.log(f"  ⚠️  No usable text format found")
-            return None
+            return None, None
             
         except requests.exceptions.HTTPError as e:
             if '500' in str(e):
                 self.log(f"  ⚠️  Congress API error (500) - bill may not have text")
             else:
                 self.log(f"  ⚠️  HTTP error: {e}")
-            return None
+            return None, None
         except Exception as e:
             self.log(f"  ✗ Error getting bill text: {str(e)}")
-            return None
+            return None, None
     
-    def save_bill_to_s3(self, congress_num, bill_type, bill_number, text_content, metadata):
-        """Save extracted bill text to S3 as TXT file with metadata for transformation lambda"""
+    def save_bill_to_s3(self, congress_num, bill_type, bill_number, text_content, metadata, document_url):
+        """Save extracted bill text to S3 as TXT file with unified metadata schema"""
         try:
             # Create structured text document with metadata header
             header = f"""BILL METADATA:
@@ -380,6 +397,7 @@ Title: {metadata.get('title', 'N/A')}
 Introduced Date: {metadata.get('introducedDate', 'N/A')}
 Latest Action: {metadata.get('latestAction', {}).get('text', 'N/A')}
 Latest Action Date: {metadata.get('latestAction', {}).get('actionDate', 'N/A')}
+Document URL: {document_url}
 
 BILL TEXT:
 {text_content}
@@ -393,29 +411,54 @@ BILL TEXT:
                 self.log(f"  ✗ File too large: {size_mb:.2f}MB (KB limit is 50MB)")
                 return False
             
-            # Prepare metadata for transformation lambda
-            # These will be available as x-amz-meta-* in the transformation lambda
+            # Extract year with fallback strategy
+            # 1. Try introduced_date first
+            introduced_date = metadata.get('introducedDate', '')
+            year = introduced_date.split('-')[0] if introduced_date else ''
+            
+            # 2. If no introduced_date, try latest action date
+            if not year:
+                latest_action = metadata.get('latestAction', {})
+                action_date = latest_action.get('actionDate', '')
+                year = action_date.split('-')[0] if action_date else ''
+            
+            # 3. If still no year, calculate from congress number
+            # Each congress is 2 years, starting from 1789
+            if not year:
+                # Congress 1 = 1789-1791, Congress 2 = 1791-1793, etc.
+                start_year = 1789 + ((congress_num - 1) * 2)
+                year = str(start_year)
+                self.log(f"  ℹ️  No date found, using congress start year: {year}")
+            
+            # UNIFIED METADATA SCHEMA - works for both bills and newspapers
+            # Fill bill-specific fields, set newspaper fields to empty string
             latest_action = metadata.get('latestAction', {})
             s3_metadata = {
-                # Core identifiers (required by transformation lambda)
-                'bill_id': f"congress_{congress_num}_{bill_type}_{bill_number}",
+                # Common fields (always present)
+                'entity_type': 'bill',
+                'source': 'congress.gov',
+                'year': year or '',
+                
+                # Bill-specific fields
                 'congress': str(congress_num),
                 'bill_type': bill_type.upper(),
                 'bill_number': str(bill_number),
+                'bill_id': f"congress_{congress_num}_{bill_type}_{bill_number}",
+                'bill_title': (metadata.get('title', '') or '')[:1024],
+                'introduced_date': (introduced_date or '')[:100],
+                'latest_action_date': (latest_action.get('actionDate', '') or '')[:100],  # ADD THIS
+                'bill_url': document_url[:1024],  # Actual PDF/TXT URL from API
                 
-                # Additional metadata for enriched responses
-                'title': (metadata.get('title', '') or 'N/A')[:1024],  # S3 metadata limit
-                'introduced_date': (metadata.get('introducedDate', '') or 'N/A')[:100],
-                'latest_action': (latest_action.get('text', '') or 'N/A')[:1024],
-                'latest_action_date': (latest_action.get('actionDate', '') or 'N/A')[:100],
-                
-                # Source information
-                'source': 'congress.gov',
-                'entity_type': 'bill',
+                # Newspaper-specific fields (empty for bills)
+                'newspaper_title': '',
+                'issue_date': '',
+                'place_of_publication': '',
+                'pdf_url': '',
+                'edition_notes': '',
             }
             
-            # Save to S3 as TXT file with metadata for transformation lambda
-            key = f"extracted/congress_{congress_num}/{bill_type}_{bill_number}.txt"
+            # Save to S3 in bills/ folder (for Knowledge Base ingestion)
+            key = f"bills/congress_{congress_num}/{bill_type}_{bill_number}.txt"
             s3.put_object(
                 Bucket=BUCKET_NAME,
                 Key=key,
@@ -425,52 +468,89 @@ BILL TEXT:
             )
             
             self.log(f"  ✓ Saved to S3: {key} ({size_mb:.2f}MB)")
-            self.log(f"  ✓ Added metadata for transformation lambda: bill_id={s3_metadata['bill_id']}")
+            self.log(f"  ✓ Unified metadata: entity_type=bill, year={year}, congress={congress_num}")
+            self.log(f"  ✓ Document URL: {document_url}")
             return True
             
         except Exception as e:
             self.log(f"  ✗ Error saving to S3: {str(e)}")
             return False
     
-    def save_newspaper_to_s3(self, page_id, date, title, text_content):
-        """Save extracted newspaper text to S3"""
+    def save_newspaper_to_s3(self, newspaper_data: Dict[str, Any], batch_num: int, index: int) -> bool:
+        """
+        Save newspaper OCR text to S3 with unified metadata schema
+        Uses same metadata fields as bills for consistent filtering
+        
+        Args:
+            newspaper_data: Row from Hugging Face dataset
+            batch_num: Batch number (1-3) for organizing into separate data sources
+            index: Index within the batch
+        """
         try:
-            # Create metadata header
-            header = f"""# Library of Congress Newspaper
-# Page ID: {page_id}
-# Title: {title}
-# Date: {date}
-
----
-
-"""
-            full_content = header + text_content
-            content_bytes = full_content.encode('utf-8')
+            # Extract data from Hugging Face dataset
+            ocr_text = newspaper_data.get('ocr_text', '')
+            pdf_url = newspaper_data.get('pdf_url', '')
+            newspaper_title = newspaper_data.get('newspaper_title', 'Unknown')
+            issue_date = newspaper_data.get('issue_date', 'Unknown')
+            place_of_publication = newspaper_data.get('place_of_publication', 'Unknown')
+            edition_notes = newspaper_data.get('edition_notes', '')
+            
+            # Validate required fields
+            if not ocr_text or not pdf_url:
+                self.log(f"  ✗ Missing required fields (ocr_text or pdf_url)")
+                return False
+            
+            # Check text size
+            content_bytes = ocr_text.encode('utf-8')
             size_mb = len(content_bytes) / (1024 * 1024)
             
             if size_mb > 50:
-                self.log(f"  ✗ File too large: {size_mb:.2f}MB")
+                self.log(f"  ✗ File too large: {size_mb:.2f}MB (KB limit is 50MB)")
                 return False
             
-            # Save to S3
-            year = date.split('-')[0] if date else 'unknown'
-            safe_page_id = page_id.replace('/', '_').replace(':', '_')
-            key = f"extracted/newspapers_{year}/{safe_page_id}.txt"
+            # Extract year from issue_date
+            year = issue_date.split('-')[0] if issue_date and issue_date != 'Unknown' else ''
             
+            # Create S3 key with batch organization for multiple data sources
+            safe_title = newspaper_title.replace('/', '_').replace(':', '_')[:50]
+            safe_date = issue_date.replace('/', '-')
+            key = f"newspapers/batch-{batch_num}/newspaper_{index}_{safe_date}_{safe_title}.txt"
+            
+            # UNIFIED METADATA SCHEMA - works for both bills and newspapers
+            # Fill newspaper-specific fields, set bill fields to empty string
+            s3_metadata = {
+                # Common fields (always present)
+                'entity_type': 'newspaper',
+                'source': 'chroniclingamerica.loc.gov',
+                'year': year or '',
+                
+                # Bill-specific fields (empty for newspapers)
+                'congress': '',
+                'bill_type': '',
+                'bill_number': '',
+                'bill_id': '',
+                'bill_title': '',
+                'introduced_date': '',
+                
+                # Newspaper-specific fields
+                'newspaper_title': newspaper_title[:1024],
+                'issue_date': issue_date[:100],
+                'place_of_publication': place_of_publication[:256],
+                'pdf_url': pdf_url[:1024],
+                'edition_notes': edition_notes[:256] if edition_notes else '',
+            }
+            
+            # Upload to S3 with metadata
             s3.put_object(
                 Bucket=BUCKET_NAME,
                 Key=key,
                 Body=content_bytes,
                 ContentType='text/plain',
-                Metadata={
-                    'source': 'chroniclingamerica.loc.gov',
-                    'page_id': page_id[:1024],
-                    'date': date,
-                    'title': title[:1024]
-                }
+                Metadata=s3_metadata
             )
             
             self.log(f"  ✓ Saved to S3: {key} ({size_mb:.2f}MB)")
+            self.log(f"  ✓ Unified metadata: entity_type=newspaper, year={year}, title={newspaper_title[:40]}")
             return True
             
         except Exception as e:
@@ -513,10 +593,17 @@ BILL TEXT:
                 
                 self.congress_stats['total'] += 1
                 
-                # Get bill text
-                text_content = self.get_bill_text(congress_num, bill_type, bill_number)
+                # Check if file already exists in S3
+                key = f"bills/congress_{congress_num}/{bill_type}_{bill_number}.txt"
+                if self.file_exists_in_s3(key):
+                    self.log(f"  ⏭️  Already exists in S3, skipping")
+                    self.congress_stats['skipped'] += 1
+                    continue
                 
-                if text_content:
+                # Get bill text and document URL
+                text_content, document_url = self.get_bill_text(congress_num, bill_type, bill_number)
+                
+                if text_content and document_url:
                     # Save to S3
                     metadata = {
                         'title': bill.get('title', ''),
@@ -524,7 +611,7 @@ BILL TEXT:
                         'latestAction': bill.get('latestAction', {})
                     }
                     
-                    if self.save_bill_to_s3(congress_num, bill_type, bill_number, text_content, metadata):
+                    if self.save_bill_to_s3(congress_num, bill_type, bill_number, text_content, metadata, document_url):
                         self.congress_stats['successful'] += 1
                     else:
                         self.congress_stats['failed'] += 1
@@ -541,106 +628,111 @@ BILL TEXT:
             self.log(f"Error processing Congress {congress_num} {bill_type}: {str(e)}")
             self.errors.append(f"Congress {congress_num} {bill_type}: {str(e)}")
     
-    def collect_newspapers(self):
-        """Collect newspapers from Chronicling America"""
+    def collect_newspapers_from_huggingface(self):
+        """
+        Collect newspapers from Hugging Face dataset
+        Uses pre-extracted OCR text, no API calls or Textract needed
+        Automatically splits into batches of 25k for separate data sources
+        """
         self.log(f"\n{'='*60}")
-        self.log(f"Collecting Chronicling America Newspapers")
-        self.log(f"Years: {START_YEAR} to {END_YEAR}")
+        self.log(f"Collecting Newspapers from Hugging Face Dataset")
+        self.log(f"Dataset: {HUGGINGFACE_DATASET}")
         self.log(f"{'='*60}")
         
-        base_url = "https://www.loc.gov/collections/chronicling-america/"
-        page = 1
-        collected = 0
-        
-        while collected < MAX_NEWSPAPER_PAGES:
-            try:
-                params = {
-                    'dl': 'page',
-                    'dates': f"{START_YEAR}/{END_YEAR}",
-                    'fo': 'json',
-                    'c': 100,
-                    'sp': page
-                }
-                
-                self.log(f"\nFetching page {page} from LOC API...")
-                response = requests.get(base_url, params=params, timeout=30)
-                response.raise_for_status()
-                
-                data = response.json()
-                results = data.get('results', [])
-                
-                if not results:
-                    self.log(f"No more results at page {page}")
+        try:
+            # Load dataset from Hugging Face
+            self.log(f"Loading dataset from Hugging Face...")
+            dataset = load_dataset(HUGGINGFACE_DATASET, split='train')
+            total_rows = len(dataset)
+            
+            self.log(f"✓ Dataset loaded: {total_rows} newspapers available")
+            
+            # Process ALL newspapers (no limit)
+            # If MAX_NEWSPAPER_PAGES is set and > 0, use it as limit, otherwise process all
+            if MAX_NEWSPAPER_PAGES > 0:
+                rows_to_process = min(total_rows, MAX_NEWSPAPER_PAGES)
+                self.log(f"Processing {rows_to_process} newspapers (limited by MAX_NEWSPAPER_PAGES)")
+            else:
+                rows_to_process = total_rows
+                self.log(f"Processing ALL {rows_to_process} newspapers")
+            
+            # Calculate batch sizes for data sources
+            # Each data source can handle max 25,000 pages
+            batch_size = 25000
+            num_batches = (rows_to_process + batch_size - 1) // batch_size  # Ceiling division
+            
+            self.log(f"Will create {num_batches} batches (25,000 pages per batch)")
+            
+            batches = []
+            for i in range(num_batches):
+                batch_num = i + 1
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, rows_to_process)
+                batches.append((batch_num, start_idx, end_idx))
+            
+            for batch_num, start_idx, end_idx in batches:
+                if start_idx >= rows_to_process:
                     break
                 
-                self.log(f"Processing {len(results)} newspapers from page {page}")
+                batch_count = end_idx - start_idx
+                self.log(f"\n{'='*60}")
+                self.log(f"Processing Batch {batch_num}: {start_idx} to {end_idx} ({batch_count} newspapers)")
+                self.log(f"{'='*60}")
                 
-                for item in results:
-                    if collected >= MAX_NEWSPAPER_PAGES:
-                        break
-                    
+                for idx in range(start_idx, end_idx):
                     try:
-                        page_id = item.get('id', 'Unknown')
-                        title = item.get('title', 'Unknown')
-                        date = item.get('date', 'Unknown')
+                        newspaper_data = dataset[idx]
                         
-                        # Get IIIF image URL and convert to high-res PDF
-                        image_url_field = item.get('image_url')
-                        iiif_url = None
+                        # Log progress every 100 items
+                        if (idx - start_idx) % 100 == 0:
+                            progress = ((idx - start_idx + 1) / batch_count) * 100
+                            self.log(f"\n[Batch {batch_num}] Progress: {idx - start_idx + 1}/{batch_count} ({progress:.1f}%)")
                         
-                        if isinstance(image_url_field, list):
-                            for url in image_url_field:
-                                if isinstance(url, str) and 'iiif' in url and '.jpg' in url:
-                                    iiif_url = url
-                                    break
-                        elif isinstance(image_url_field, str):
-                            if 'iiif' in image_url_field and '.jpg' in image_url_field:
-                                iiif_url = image_url_field
+                        # Extract key info for logging
+                        newspaper_title = newspaper_data.get('newspaper_title', 'Unknown')[:60]
+                        issue_date = newspaper_data.get('issue_date', 'Unknown')
+                        safe_title = newspaper_title.replace('/', '_').replace(':', '_')[:50]
+                        safe_date = issue_date.replace('/', '-')
                         
-                        if not iiif_url:
-                            self.log(f"  ✗ No IIIF URL for {page_id}")
-                            continue
-                        
-                        # Convert to high-resolution PDF URL
-                        pdf_url = iiif_url.replace('/pct:6.25/', '/full/')
-                        pdf_url = pdf_url.replace('.jpg', '.pdf')
-                        pdf_url = pdf_url.split('#')[0]
-                        
-                        self.log(f"\n[{collected+1}] Processing: {title[:80]}")
-                        self.log(f"  Date: {date}")
-                        self.log(f"  PDF URL: {pdf_url}")
+                        self.log(f"\n[{idx + 1}/{rows_to_process}] {newspaper_title} | {issue_date}")
                         
                         self.newspaper_stats['total'] += 1
                         
-                        # Extract text with Textract
-                        doc_id = f"newspaper_{page_id.replace('/', '_')}"
-                        text_content = self.extract_text_with_textract(pdf_url, doc_id)
+                        # Check if file already exists in S3
+                        key = f"newspapers/batch-{batch_num}/newspaper_{idx}_{safe_date}_{safe_title}.txt"
+                        if self.file_exists_in_s3(key):
+                            self.log(f"  ⏭️  Already exists in S3, skipping")
+                            self.newspaper_stats['skipped'] += 1
+                            continue
                         
-                        if text_content:
-                            if self.save_newspaper_to_s3(page_id, date, title, text_content):
-                                self.newspaper_stats['successful'] += 1
-                                collected += 1
-                            else:
-                                self.newspaper_stats['failed'] += 1
+                        # Save to S3 with metadata
+                        if self.save_newspaper_to_s3(newspaper_data, batch_num, idx):
+                            self.newspaper_stats['successful'] += 1
                         else:
-                            self.log(f"  ✗ Text extraction failed")
                             self.newspaper_stats['failed'] += 1
+                            self.errors.append(f"Newspaper {idx}: Save failed")
                         
-                        # Rate limiting
-                        time.sleep(1)
+                        # Small delay to avoid overwhelming S3
+                        if (idx - start_idx) % 100 == 0:
+                            time.sleep(0.5)
                         
                     except Exception as e:
-                        self.log(f"  Error processing newspaper: {e}")
+                        self.log(f"  ✗ Error processing newspaper {idx}: {e}")
                         self.newspaper_stats['failed'] += 1
+                        self.errors.append(f"Newspaper {idx}: {str(e)}")
                         continue
                 
-                page += 1
-                
-            except Exception as e:
-                self.log(f"Error fetching page {page}: {e}")
-                break
-        
-        self.log(f"\nNewspaper collection complete: {collected} newspapers processed")
+                self.log(f"\n✓ Batch {batch_num} complete: {end_idx - start_idx} newspapers processed")
+            
+            self.log(f"\n{'='*60}")
+            self.log(f"Newspaper collection complete!")
+            self.log(f"Total processed: {self.newspaper_stats['successful']} newspapers")
+            self.log(f"{'='*60}")
+            
+        except Exception as e:
+            self.log(f"✗ Error loading Hugging Face dataset: {e}")
+            self.log(f"Make sure the 'datasets' library is installed: pip install datasets")
+            raise
     
     def run(self):
         """Main execution - collect from both sources"""
@@ -651,7 +743,7 @@ BILL TEXT:
         self.log(f"  S3 Bucket: {BUCKET_NAME}")
         self.log(f"  Congress Range: {START_CONGRESS} to {END_CONGRESS}")
         self.log(f"  Bill Types: {', '.join(BILL_TYPES)}")
-        self.log(f"  Newspaper Years: {START_YEAR} to {END_YEAR}")
+        self.log(f"  Hugging Face Dataset: {HUGGINGFACE_DATASET}")
         self.log(f"  Max Newspapers: {MAX_NEWSPAPER_PAGES}")
         self.log("="*60)
         
@@ -666,12 +758,12 @@ BILL TEXT:
             for bill_type in BILL_TYPES:
                 self.collect_bills_for_congress(congress_num, bill_type.strip())
         
-        # Part 2: Collect Newspapers
+        # Part 2: Collect Newspapers from Hugging Face
         self.log("\n" + "="*60)
-        self.log("PART 2: Collecting Chronicling America Newspapers")
+        self.log("PART 2: Collecting Newspapers from Hugging Face Dataset")
         self.log("="*60)
         
-        self.collect_newspapers()
+        self.collect_newspapers_from_huggingface()
         
         # Summary
         elapsed_time = time.time() - start_time
@@ -682,20 +774,24 @@ BILL TEXT:
         self.log(f"\nCongress Bills:")
         self.log(f"  Total: {self.congress_stats['total']}")
         self.log(f"  Successful: {self.congress_stats['successful']}")
+        self.log(f"  Skipped: {self.congress_stats['skipped']}")
         self.log(f"  Failed: {self.congress_stats['failed']}")
         
         self.log(f"\nNewspapers:")
         self.log(f"  Total: {self.newspaper_stats['total']}")
         self.log(f"  Successful: {self.newspaper_stats['successful']}")
+        self.log(f"  Skipped: {self.newspaper_stats['skipped']}")
         self.log(f"  Failed: {self.newspaper_stats['failed']}")
         
         total_items = self.congress_stats['total'] + self.newspaper_stats['total']
         total_successful = self.congress_stats['successful'] + self.newspaper_stats['successful']
+        total_skipped = self.congress_stats['skipped'] + self.newspaper_stats['skipped']
         total_failed = self.congress_stats['failed'] + self.newspaper_stats['failed']
         
         self.log(f"\nOverall:")
         self.log(f"  Total Items: {total_items}")
         self.log(f"  Successful: {total_successful}")
+        self.log(f"  Skipped: {total_skipped}")
         self.log(f"  Failed: {total_failed}")
         self.log(f"  Time Elapsed: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
         
@@ -712,12 +808,13 @@ BILL TEXT:
             'newspapers': self.newspaper_stats,
             'total_items': total_items,
             'total_successful': total_successful,
+            'total_skipped': total_skipped,
             'total_failed': total_failed,
             'elapsed_seconds': elapsed_time,
             'config': {
                 'congress_range': f"{START_CONGRESS}-{END_CONGRESS}",
                 'bill_types': BILL_TYPES,
-                'newspaper_years': f"{START_YEAR}-{END_YEAR}",
+                'huggingface_dataset': HUGGINGFACE_DATASET,
             },
             'timestamp': datetime.now().isoformat(),
             'errors': self.errors
@@ -735,37 +832,123 @@ BILL TEXT:
         return 0 if total_failed == 0 else 1
 
 def trigger_kb_sync():
-    """Trigger Knowledge Base sync after collection completes"""
+    """
+    Trigger Knowledge Base sync for all 4 data sources SEQUENTIALLY
+    Waits for each data source to complete before starting the next one
+    """
     try:
-        # Get KB IDs from environment or use defaults
+        # Get KB ID from environment
         kb_id = os.environ.get('KNOWLEDGE_BASE_ID')
-        ds_id = os.environ.get('DATA_SOURCE_ID')
         
-        if not kb_id or not ds_id:
-            print("⚠️  KB sync skipped: KNOWLEDGE_BASE_ID or DATA_SOURCE_ID not set")
+        if not kb_id:
+            print("⚠️  KB sync skipped: KNOWLEDGE_BASE_ID not set")
             return
         
         print(f"\n{'='*60}")
-        print("Triggering Knowledge Base Sync")
+        print("Triggering Sequential Knowledge Base Sync")
         print(f"{'='*60}")
         print(f"Knowledge Base ID: {kb_id}")
-        print(f"Data Source ID: {ds_id}")
         
         bedrock_agent = boto3.client('bedrock-agent')
         
-        response = bedrock_agent.start_ingestion_job(
+        # List all data sources for this Knowledge Base
+        print("\nFetching data sources...")
+        response = bedrock_agent.list_data_sources(
             knowledgeBaseId=kb_id,
-            dataSourceId=ds_id
+            maxResults=10
         )
         
-        job_id = response['ingestionJob']['ingestionJobId']
-        print(f"✓ Ingestion job started: {job_id}")
-        print(f"Entity extraction will complete in 5-10 minutes")
+        data_sources = response.get('dataSourceSummaries', [])
+        
+        if not data_sources:
+            print("⚠️  No data sources found for this Knowledge Base")
+            return
+        
+        print(f"Found {len(data_sources)} data sources")
+        print("Will sync sequentially to avoid overload\n")
+        
+        # Sync each data source sequentially
+        for idx, ds in enumerate(data_sources, 1):
+            ds_id = ds['dataSourceId']
+            ds_name = ds.get('name', 'Unknown')
+            
+            try:
+                print(f"\n{'='*60}")
+                print(f"[{idx}/{len(data_sources)}] Syncing: {ds_name}")
+                print(f"{'='*60}")
+                
+                # Start ingestion job
+                sync_response = bedrock_agent.start_ingestion_job(
+                    knowledgeBaseId=kb_id,
+                    dataSourceId=ds_id
+                )
+                
+                job_id = sync_response['ingestionJob']['ingestionJobId']
+                print(f"✓ Ingestion job started: {job_id}")
+                
+                # Poll for completion
+                print("Waiting for ingestion to complete...")
+                max_wait = 7200  # 2 hours max per data source
+                poll_interval = 30  # Check every 30 seconds
+                elapsed = 0
+                
+                while elapsed < max_wait:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    
+                    # Check job status
+                    job_response = bedrock_agent.get_ingestion_job(
+                        knowledgeBaseId=kb_id,
+                        dataSourceId=ds_id,
+                        ingestionJobId=job_id
+                    )
+                    
+                    status = job_response['ingestionJob']['status']
+                    
+                    # Log progress every 5 minutes
+                    if elapsed % 300 == 0:
+                        minutes = elapsed // 60
+                        print(f"  Status: {status} ({minutes} minutes elapsed)")
+                    
+                    if status == 'COMPLETE':
+                        stats = job_response['ingestionJob'].get('statistics', {})
+                        docs_scanned = stats.get('numberOfDocumentsScanned', 0)
+                        docs_indexed = stats.get('numberOfNewDocumentsIndexed', 0)
+                        docs_modified = stats.get('numberOfModifiedDocumentsIndexed', 0)
+                        docs_deleted = stats.get('numberOfDocumentsDeleted', 0)
+                        docs_failed = stats.get('numberOfDocumentsFailed', 0)
+                        
+                        print(f"\n✓ Ingestion COMPLETE for {ds_name}")
+                        print(f"  Documents scanned: {docs_scanned}")
+                        print(f"  Documents indexed: {docs_indexed}")
+                        print(f"  Documents modified: {docs_modified}")
+                        print(f"  Documents deleted: {docs_deleted}")
+                        print(f"  Documents failed: {docs_failed}")
+                        print(f"  Time taken: {elapsed // 60} minutes")
+                        break
+                    
+                    elif status == 'FAILED':
+                        failure_reasons = job_response['ingestionJob'].get('failureReasons', [])
+                        print(f"\n✗ Ingestion FAILED for {ds_name}")
+                        print(f"  Failure reasons: {', '.join(failure_reasons)}")
+                        break
+                
+                if elapsed >= max_wait:
+                    print(f"\n⚠️  Timeout waiting for {ds_name} (exceeded 2 hours)")
+                    print(f"  Job may still be running. Check AWS Console.")
+                
+            except Exception as e:
+                print(f"\n✗ Failed to sync {ds_name}: {e}")
+                print(f"  Continuing to next data source...")
+                continue
+        
+        print(f"\n{'='*60}")
+        print("All data sources sync complete!")
         print(f"{'='*60}\n")
         
     except Exception as e:
         print(f"⚠️  Failed to trigger KB sync: {e}")
-        print("You can trigger it manually later")
+        print("You can trigger it manually later from AWS Console")
 
 if __name__ == '__main__':
     if not BUCKET_NAME:

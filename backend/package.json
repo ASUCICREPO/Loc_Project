@@ -1,5 +1,5 @@
 {
-  "name": "library-of-congress-backend",
+  "name": "chronicling-america-backend",
   "version": "1.0.0",
   "description": "AWS CDK infrastructure for Chronicling America historical newspaper pipeline",
   "bin": {
@@ -27,6 +27,7 @@
     "typescript": "^5.3.3"
   },
   "dependencies": {
+    "@cdklabs/generative-ai-cdk-constructs": "^0.1.0",
     "aws-cdk-lib": "^2.179.0",
     "constructs": "^10.3.0",
     "source-map-support": "^0.5.21"

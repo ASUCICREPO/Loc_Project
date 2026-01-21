@@ -17,7 +17,7 @@ clean_url=${clean_url%/}
 # Get project name
 if [ -z "${PROJECT_NAME:-}" ]; then
   read -rp "Enter project name [default: chronicling-america-pipeline]: " PROJECT_NAME
-  PROJECT_NAME=${PROJECT_NAME:-chronicling-america-pipeline}
+  PROJECT_NAME=${PROJECT_NAME:-loc}
 fi
 
 # Get AWS region
