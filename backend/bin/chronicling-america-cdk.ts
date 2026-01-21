@@ -18,7 +18,7 @@ new ChroniclingAmericaStack(app, "LOCstack", {
   bedrockModelId,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: process.env.CDK_DEFAULT_REGION || "us-west-2",
+    region: process.env.CDK_DEFAULT_REGION ,
   },
   description:
     "Historical newspaper data extraction pipeline with Bedrock and Neptune (v2)",
