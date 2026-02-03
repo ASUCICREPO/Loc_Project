@@ -16,6 +16,9 @@ from datetime import datetime
 from typing import List, Dict, Any
 from datasets import load_dataset
 
+# Import Direct Ingestion module
+from direct_ingestion import trigger_kb_sync_with_direct_ingestion
+
 # Configuration
 CONGRESS_API_KEY = os.environ.get('CONGRESS_API_KEY', 'MThtRT5WkFu8I8CHOfiLLebG4nsnKcX3JnNv2N8A')
 BUCKET_NAME = os.environ.get('BUCKET_NAME')
@@ -433,27 +436,27 @@ BILL TEXT:
             # UNIFIED METADATA SCHEMA - works for both bills and newspapers
             # Fill bill-specific fields, set newspaper fields to empty string
             latest_action = metadata.get('latestAction', {})
+            # NOTE: S3 object metadata has a 2KB total limit, so we truncate long fields
             s3_metadata = {
                 # Common fields (always present)
                 'entity_type': 'bill',
                 'source': 'congress.gov',
                 'year': year or '',
+                'source_url': document_url[:1024],  # Truncated for S3 metadata limit
                 
                 # Bill-specific fields
                 'congress': str(congress_num),
                 'bill_type': bill_type.upper(),
                 'bill_number': str(bill_number),
                 'bill_id': f"congress_{congress_num}_{bill_type}_{bill_number}",
-                'bill_title': (metadata.get('title', '') or '')[:1024],
+                'bill_title': (metadata.get('title', '') or '')[:1024],  # Truncated for S3 metadata limit
                 'introduced_date': (introduced_date or '')[:100],
-                'latest_action_date': (latest_action.get('actionDate', '') or '')[:100],  # ADD THIS
-                'bill_url': document_url[:1024],  # Actual PDF/TXT URL from API
+                'latest_action_date': (latest_action.get('actionDate', '') or '')[:100],
                 
                 # Newspaper-specific fields (empty for bills)
                 'newspaper_title': '',
                 'issue_date': '',
                 'place_of_publication': '',
-                'pdf_url': '',
                 'edition_notes': '',
             }
             
@@ -467,7 +470,49 @@ BILL TEXT:
                 Metadata=s3_metadata
             )
             
+            # ALSO create separate .metadata.json file for Knowledge Base
+            # Knowledge Base can only read metadata from separate JSON files, not S3 object metadata
+            # No truncation needed here - JSON files have no size limits
+            metadata_key = f"{key}.metadata.json"
+            
+            # Build metadata attributes - only include non-empty values
+            # Knowledge Base requires: strings, numbers, or booleans only
+            metadata_attrs = {
+                "entity_type": "bill",
+                "source": "congress_gov",
+                "congress": str(congress_num),
+                "bill_type": bill_type.upper(),
+                "bill_number": str(bill_number),
+                "bill_id": f"{bill_type}{bill_number}-{congress_num}"
+            }
+            
+            # Add optional fields only if they have values
+            if year:
+                metadata_attrs["year"] = str(year)
+            
+            if document_url:
+                metadata_attrs["source_url"] = document_url
+            
+            bill_title = metadata.get('title', '') or ''
+            if bill_title:
+                metadata_attrs["bill_title"] = bill_title
+            
+            if introduced_date:
+                metadata_attrs["introduced_date"] = introduced_date
+            
+            metadata_json = {
+                "metadataAttributes": metadata_attrs
+            }
+            
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=metadata_key,
+                Body=json.dumps(metadata_json),
+                ContentType='application/json'
+            )
+            
             self.log(f"  ✓ Saved to S3: {key} ({size_mb:.2f}MB)")
+            self.log(f"  ✓ Metadata file: {metadata_key}")
             self.log(f"  ✓ Unified metadata: entity_type=bill, year={year}, congress={congress_num}")
             self.log(f"  ✓ Document URL: {document_url}")
             return True
@@ -476,15 +521,15 @@ BILL TEXT:
             self.log(f"  ✗ Error saving to S3: {str(e)}")
             return False
     
-    def save_newspaper_to_s3(self, newspaper_data: Dict[str, Any], batch_num: int, index: int) -> bool:
+    def save_newspaper_to_s3(self, newspaper_data: Dict[str, Any], index: int) -> bool:
         """
         Save newspaper OCR text to S3 with unified metadata schema
         Uses same metadata fields as bills for consistent filtering
+        No batch folders needed - all files in newspapers/ folder
         
         Args:
             newspaper_data: Row from Hugging Face dataset
-            batch_num: Batch number (1-3) for organizing into separate data sources
-            index: Index within the batch
+            index: Index of the newspaper in the dataset
         """
         try:
             # Extract data from Hugging Face dataset
@@ -511,18 +556,20 @@ BILL TEXT:
             # Extract year from issue_date
             year = issue_date.split('-')[0] if issue_date and issue_date != 'Unknown' else ''
             
-            # Create S3 key with batch organization for multiple data sources
+            # Create S3 key - all files in newspapers/ folder (no batches!)
             safe_title = newspaper_title.replace('/', '_').replace(':', '_')[:50]
             safe_date = issue_date.replace('/', '-')
-            key = f"newspapers/batch-{batch_num}/newspaper_{index}_{safe_date}_{safe_title}.txt"
+            key = f"newspapers/newspaper_{index}_{safe_date}_{safe_title}.txt"
             
             # UNIFIED METADATA SCHEMA - works for both bills and newspapers
             # Fill newspaper-specific fields, set bill fields to empty string
+            # NOTE: S3 object metadata has a 2KB total limit, so we truncate long fields
             s3_metadata = {
                 # Common fields (always present)
                 'entity_type': 'newspaper',
                 'source': 'chroniclingamerica.loc.gov',
                 'year': year or '',
+                'source_url': pdf_url[:1024],  # Truncated for S3 metadata limit
                 
                 # Bill-specific fields (empty for newspapers)
                 'congress': '',
@@ -533,10 +580,9 @@ BILL TEXT:
                 'introduced_date': '',
                 
                 # Newspaper-specific fields
-                'newspaper_title': newspaper_title[:1024],
+                'newspaper_title': newspaper_title[:1024],  # Truncated for S3 metadata limit
                 'issue_date': issue_date[:100],
                 'place_of_publication': place_of_publication[:256],
-                'pdf_url': pdf_url[:1024],
                 'edition_notes': edition_notes[:256] if edition_notes else '',
             }
             
@@ -549,7 +595,50 @@ BILL TEXT:
                 Metadata=s3_metadata
             )
             
+            # ALSO create separate .metadata.json file for Knowledge Base
+            # Knowledge Base can only read metadata from separate JSON files, not S3 object metadata
+            # No truncation needed here - JSON files have no size limits
+            metadata_key = f"{key}.metadata.json"
+            
+            # Build metadata attributes - only include non-empty values
+            # Knowledge Base requires: strings, numbers, or booleans only
+            metadata_attrs = {
+                "entity_type": "newspaper",
+                "source": "chronicling_america"
+            }
+            
+            # Add optional fields only if they have values
+            if year:
+                metadata_attrs["year"] = str(year)
+            
+            if pdf_url:
+                metadata_attrs["source_url"] = pdf_url
+            
+            if newspaper_title and newspaper_title != 'Unknown':
+                metadata_attrs["newspaper_title"] = newspaper_title
+            
+            if issue_date and issue_date != 'Unknown':
+                metadata_attrs["issue_date"] = issue_date
+            
+            if place_of_publication and place_of_publication != 'Unknown':
+                metadata_attrs["place_of_publication"] = place_of_publication
+            
+            if edition_notes:
+                metadata_attrs["edition_notes"] = edition_notes
+            
+            metadata_json = {
+                "metadataAttributes": metadata_attrs
+            }
+            
+            s3.put_object(
+                Bucket=BUCKET_NAME,
+                Key=metadata_key,
+                Body=json.dumps(metadata_json),
+                ContentType='application/json'
+            )
+            
             self.log(f"  ✓ Saved to S3: {key} ({size_mb:.2f}MB)")
+            self.log(f"  ✓ Metadata file: {metadata_key}")
             self.log(f"  ✓ Unified metadata: entity_type=newspaper, year={year}, title={newspaper_title[:40]}")
             return True
             
@@ -632,7 +721,7 @@ BILL TEXT:
         """
         Collect newspapers from Hugging Face dataset
         Uses pre-extracted OCR text, no API calls or Textract needed
-        Automatically splits into batches of 25k for separate data sources
+        Stores all files in single newspapers/ folder (no batches needed with Direct Ingestion)
         """
         self.log(f"\n{'='*60}")
         self.log(f"Collecting Newspapers from Hugging Face Dataset")
@@ -656,73 +745,52 @@ BILL TEXT:
                 rows_to_process = total_rows
                 self.log(f"Processing ALL {rows_to_process} newspapers")
             
-            # Calculate batch sizes for data sources
-            # Each data source can handle max 25,000 pages
-            batch_size = 25000
-            num_batches = (rows_to_process + batch_size - 1) // batch_size  # Ceiling division
+            self.log(f"Storing all files in newspapers/ folder (no batches needed)")
+            self.log(f"Direct Ingestion API will handle all files without 1000-file limit\n")
             
-            self.log(f"Will create {num_batches} batches (25,000 pages per batch)")
-            
-            batches = []
-            for i in range(num_batches):
-                batch_num = i + 1
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, rows_to_process)
-                batches.append((batch_num, start_idx, end_idx))
-            
-            for batch_num, start_idx, end_idx in batches:
-                if start_idx >= rows_to_process:
-                    break
-                
-                batch_count = end_idx - start_idx
-                self.log(f"\n{'='*60}")
-                self.log(f"Processing Batch {batch_num}: {start_idx} to {end_idx} ({batch_count} newspapers)")
-                self.log(f"{'='*60}")
-                
-                for idx in range(start_idx, end_idx):
-                    try:
-                        newspaper_data = dataset[idx]
-                        
-                        # Log progress every 100 items
-                        if (idx - start_idx) % 100 == 0:
-                            progress = ((idx - start_idx + 1) / batch_count) * 100
-                            self.log(f"\n[Batch {batch_num}] Progress: {idx - start_idx + 1}/{batch_count} ({progress:.1f}%)")
-                        
-                        # Extract key info for logging
-                        newspaper_title = newspaper_data.get('newspaper_title', 'Unknown')[:60]
-                        issue_date = newspaper_data.get('issue_date', 'Unknown')
-                        safe_title = newspaper_title.replace('/', '_').replace(':', '_')[:50]
-                        safe_date = issue_date.replace('/', '-')
-                        
-                        self.log(f"\n[{idx + 1}/{rows_to_process}] {newspaper_title} | {issue_date}")
-                        
-                        self.newspaper_stats['total'] += 1
-                        
-                        # Check if file already exists in S3
-                        key = f"newspapers/batch-{batch_num}/newspaper_{idx}_{safe_date}_{safe_title}.txt"
-                        if self.file_exists_in_s3(key):
-                            self.log(f"  ⏭️  Already exists in S3, skipping")
-                            self.newspaper_stats['skipped'] += 1
-                            continue
-                        
-                        # Save to S3 with metadata
-                        if self.save_newspaper_to_s3(newspaper_data, batch_num, idx):
-                            self.newspaper_stats['successful'] += 1
-                        else:
-                            self.newspaper_stats['failed'] += 1
-                            self.errors.append(f"Newspaper {idx}: Save failed")
-                        
-                        # Small delay to avoid overwhelming S3
-                        if (idx - start_idx) % 100 == 0:
-                            time.sleep(0.5)
-                        
-                    except Exception as e:
-                        self.log(f"  ✗ Error processing newspaper {idx}: {e}")
-                        self.newspaper_stats['failed'] += 1
-                        self.errors.append(f"Newspaper {idx}: {str(e)}")
+            # Process all newspapers sequentially
+            for idx in range(rows_to_process):
+                try:
+                    newspaper_data = dataset[idx]
+                    
+                    # Log progress every 100 items
+                    if idx % 100 == 0:
+                        progress = ((idx + 1) / rows_to_process) * 100
+                        self.log(f"\nProgress: {idx + 1}/{rows_to_process} ({progress:.1f}%)")
+                    
+                    # Extract key info for logging
+                    newspaper_title = newspaper_data.get('newspaper_title', 'Unknown')[:60]
+                    issue_date = newspaper_data.get('issue_date', 'Unknown')
+                    safe_title = newspaper_title.replace('/', '_').replace(':', '_')[:50]
+                    safe_date = issue_date.replace('/', '-')
+                    
+                    self.log(f"[{idx + 1}/{rows_to_process}] {newspaper_title} | {issue_date}")
+                    
+                    self.newspaper_stats['total'] += 1
+                    
+                    # Check if file already exists in S3 (no batch folder!)
+                    key = f"newspapers/newspaper_{idx}_{safe_date}_{safe_title}.txt"
+                    if self.file_exists_in_s3(key):
+                        self.log(f"  ⏭️  Already exists in S3, skipping")
+                        self.newspaper_stats['skipped'] += 1
                         continue
-                
-                self.log(f"\n✓ Batch {batch_num} complete: {end_idx - start_idx} newspapers processed")
+                    
+                    # Save to S3 with metadata (no batch_num needed!)
+                    if self.save_newspaper_to_s3(newspaper_data, idx):
+                        self.newspaper_stats['successful'] += 1
+                    else:
+                        self.newspaper_stats['failed'] += 1
+                        self.errors.append(f"Newspaper {idx}: Save failed")
+                    
+                    # Small delay to avoid overwhelming S3
+                    if idx % 100 == 0:
+                        time.sleep(0.5)
+                    
+                except Exception as e:
+                    self.log(f"  ✗ Error processing newspaper {idx}: {e}")
+                    self.newspaper_stats['failed'] += 1
+                    self.errors.append(f"Newspaper {idx}: {str(e)}")
+                    continue
             
             self.log(f"\n{'='*60}")
             self.log(f"Newspaper collection complete!")
@@ -831,124 +899,7 @@ BILL TEXT:
         
         return 0 if total_failed == 0 else 1
 
-def trigger_kb_sync():
-    """
-    Trigger Knowledge Base sync for all 4 data sources SEQUENTIALLY
-    Waits for each data source to complete before starting the next one
-    """
-    try:
-        # Get KB ID from environment
-        kb_id = os.environ.get('KNOWLEDGE_BASE_ID')
-        
-        if not kb_id:
-            print("⚠️  KB sync skipped: KNOWLEDGE_BASE_ID not set")
-            return
-        
-        print(f"\n{'='*60}")
-        print("Triggering Sequential Knowledge Base Sync")
-        print(f"{'='*60}")
-        print(f"Knowledge Base ID: {kb_id}")
-        
-        bedrock_agent = boto3.client('bedrock-agent')
-        
-        # List all data sources for this Knowledge Base
-        print("\nFetching data sources...")
-        response = bedrock_agent.list_data_sources(
-            knowledgeBaseId=kb_id,
-            maxResults=10
-        )
-        
-        data_sources = response.get('dataSourceSummaries', [])
-        
-        if not data_sources:
-            print("⚠️  No data sources found for this Knowledge Base")
-            return
-        
-        print(f"Found {len(data_sources)} data sources")
-        print("Will sync sequentially to avoid overload\n")
-        
-        # Sync each data source sequentially
-        for idx, ds in enumerate(data_sources, 1):
-            ds_id = ds['dataSourceId']
-            ds_name = ds.get('name', 'Unknown')
-            
-            try:
-                print(f"\n{'='*60}")
-                print(f"[{idx}/{len(data_sources)}] Syncing: {ds_name}")
-                print(f"{'='*60}")
-                
-                # Start ingestion job
-                sync_response = bedrock_agent.start_ingestion_job(
-                    knowledgeBaseId=kb_id,
-                    dataSourceId=ds_id
-                )
-                
-                job_id = sync_response['ingestionJob']['ingestionJobId']
-                print(f"✓ Ingestion job started: {job_id}")
-                
-                # Poll for completion
-                print("Waiting for ingestion to complete...")
-                max_wait = 7200  # 2 hours max per data source
-                poll_interval = 30  # Check every 30 seconds
-                elapsed = 0
-                
-                while elapsed < max_wait:
-                    time.sleep(poll_interval)
-                    elapsed += poll_interval
-                    
-                    # Check job status
-                    job_response = bedrock_agent.get_ingestion_job(
-                        knowledgeBaseId=kb_id,
-                        dataSourceId=ds_id,
-                        ingestionJobId=job_id
-                    )
-                    
-                    status = job_response['ingestionJob']['status']
-                    
-                    # Log progress every 5 minutes
-                    if elapsed % 300 == 0:
-                        minutes = elapsed // 60
-                        print(f"  Status: {status} ({minutes} minutes elapsed)")
-                    
-                    if status == 'COMPLETE':
-                        stats = job_response['ingestionJob'].get('statistics', {})
-                        docs_scanned = stats.get('numberOfDocumentsScanned', 0)
-                        docs_indexed = stats.get('numberOfNewDocumentsIndexed', 0)
-                        docs_modified = stats.get('numberOfModifiedDocumentsIndexed', 0)
-                        docs_deleted = stats.get('numberOfDocumentsDeleted', 0)
-                        docs_failed = stats.get('numberOfDocumentsFailed', 0)
-                        
-                        print(f"\n✓ Ingestion COMPLETE for {ds_name}")
-                        print(f"  Documents scanned: {docs_scanned}")
-                        print(f"  Documents indexed: {docs_indexed}")
-                        print(f"  Documents modified: {docs_modified}")
-                        print(f"  Documents deleted: {docs_deleted}")
-                        print(f"  Documents failed: {docs_failed}")
-                        print(f"  Time taken: {elapsed // 60} minutes")
-                        break
-                    
-                    elif status == 'FAILED':
-                        failure_reasons = job_response['ingestionJob'].get('failureReasons', [])
-                        print(f"\n✗ Ingestion FAILED for {ds_name}")
-                        print(f"  Failure reasons: {', '.join(failure_reasons)}")
-                        break
-                
-                if elapsed >= max_wait:
-                    print(f"\n⚠️  Timeout waiting for {ds_name} (exceeded 2 hours)")
-                    print(f"  Job may still be running. Check AWS Console.")
-                
-            except Exception as e:
-                print(f"\n✗ Failed to sync {ds_name}: {e}")
-                print(f"  Continuing to next data source...")
-                continue
-        
-        print(f"\n{'='*60}")
-        print("All data sources sync complete!")
-        print(f"{'='*60}\n")
-        
-    except Exception as e:
-        print(f"⚠️  Failed to trigger KB sync: {e}")
-        print("You can trigger it manually later from AWS Console")
+
 
 if __name__ == '__main__':
     if not BUCKET_NAME:
@@ -958,7 +909,11 @@ if __name__ == '__main__':
     collector = DataCollector()
     exit_code = collector.run()
     
-    # Trigger KB sync after collection (even if some items failed)
-    trigger_kb_sync()
+    # Trigger KB sync with Direct Ingestion API after collection
+    kb_id = os.environ.get('KNOWLEDGE_BASE_ID')
+    if kb_id:
+        trigger_kb_sync_with_direct_ingestion(kb_id)
+    else:
+        print("⚠️  KNOWLEDGE_BASE_ID not set, skipping KB sync")
     
     sys.exit(exit_code)

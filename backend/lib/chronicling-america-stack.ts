@@ -202,15 +202,17 @@ export class ChroniclingAmericaStack extends cdk.Stack {
     dataBucket.grantReadWrite(fargateTaskRole);
     supplementalBucket.grantReadWrite(fargateTaskRole);
 
-    // Grant Bedrock permissions to Fargate task (for triggering KB sync)
+    // Grant Bedrock permissions to Fargate task (for Direct Ingestion API)
     fargateTaskRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: [
-          "bedrock:StartIngestionJob",
+          "bedrock:StartIngestionJob",  // For bills sync
           "bedrock:GetIngestionJob",
           "bedrock:ListIngestionJobs",
-          "bedrock:ListDataSources",  // Required to list all data sources before syncing
+          "bedrock:ListDataSources",
+          "bedrock:GetDataSource",
+          "bedrock:IngestKnowledgeBaseDocuments",  // NEW: Direct Ingestion API for newspapers
         ],
         resources: ["*"],
       })
@@ -369,11 +371,11 @@ Focus on delivering precise historical information with proper citations from th
     });
 
     // ========================================
-    // S3 Data Sources (4 total: 1 for bills, 3 for newspapers)
+    // S3 Data Sources (2 total: 1 for bills, 1 for newspapers with rotating prefix)
     // ========================================
     
-    // Data Source 1: Congress Bills
-    new bedrockConstructs.S3DataSource(this, "BillsDataSource", {
+    // Data Source 1: Congress Bills (static)
+    const billsDataSource = new bedrockConstructs.S3DataSource(this, "BillsDataSource", {
       bucket: dataBucket,
       knowledgeBase: kb,
       dataSourceName: "congress-bills",
@@ -388,12 +390,14 @@ Focus on delivering precise historical information with proper citations from th
       inclusionPrefixes: ["bills/"], // All files in bills/ folder
     });
 
-    // Data Source 2: Newspapers Batch 1 (0-25,000 pages)
-    new bedrockConstructs.S3DataSource(this, "NewspapersBatch1DataSource", {
+    // Data Source 2: Newspapers (single data source, uses Direct Ingestion API)
+    // Instead of syncing entire prefixes, we'll use IngestKnowledgeBaseDocuments API
+    // to add files individually/in batches - no 1000-file limit, no rotation needed!
+    const newspapersDataSource = new bedrockConstructs.S3DataSource(this, "NewspapersDataSource", {
       bucket: dataBucket,
       knowledgeBase: kb,
-      dataSourceName: "newspapers-batch-1",
-      description: "Chronicling America newspapers 1770-1810 (Batch 1: pages 0-25,000)",
+      dataSourceName: "newspapers",
+      description: "Chronicling America newspapers 1770-1810 (uses Direct Ingestion API)",
       chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
         maxTokens: 1500,
         overlapPercentage: 20,
@@ -401,44 +405,15 @@ Focus on delivering precise historical information with proper citations from th
       contextEnrichment: ContextEnrichment.foundationModel({
         enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
       }),
-      inclusionPrefixes: ["newspapers/batch-1/"],
-    });
-
-    // Data Source 3: Newspapers Batch 2 (25,001-50,000 pages)
-    new bedrockConstructs.S3DataSource(this, "NewspapersBatch2DataSource", {
-      bucket: dataBucket,
-      knowledgeBase: kb,
-      dataSourceName: "newspapers-batch-2",
-      description: "Chronicling America newspapers 1770-1810 (Batch 2: pages 25,001-50,000)",
-      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
-        maxTokens: 1500,
-        overlapPercentage: 20,
-      }),
-      contextEnrichment: ContextEnrichment.foundationModel({
-        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
-      }),
-      inclusionPrefixes: ["newspapers/batch-2/"],
-    });
-
-    // Data Source 4: Newspapers Batch 3 (50,001-58,000 pages)
-    new bedrockConstructs.S3DataSource(this, "NewspapersBatch3DataSource", {
-      bucket: dataBucket,
-      knowledgeBase: kb,
-      dataSourceName: "newspapers-batch-3",
-      description: "Chronicling America newspapers 1770-1810 (Batch 3: pages 50,001-58,000)",
-      chunkingStrategy: bedrockConstructs.ChunkingStrategy.fixedSize({
-        maxTokens: 1500,
-        overlapPercentage: 20,
-      }),
-      contextEnrichment: ContextEnrichment.foundationModel({
-        enrichmentModel: bedrockConstructs.BedrockFoundationModel.ANTHROPIC_CLAUDE_HAIKU_V1_0,
-      }),
-      inclusionPrefixes: ["newspapers/batch-3/"],
+      inclusionPrefixes: ["newspapers/"], // All newspapers, ingested via API not sync
     });
 
     const knowledgeBaseId = kb.knowledgeBaseId;
-    // Note: All 4 data sources are automatically associated with the KB
-    // Each data source handles up to 25,000 pages (Bedrock limit)
+    const billsDataSourceId = billsDataSource.dataSourceId;
+    const newspapersDataSourceId = newspapersDataSource.dataSourceId;
+    
+    // Note: Newspapers will be ingested using IngestKnowledgeBaseDocuments API
+    // This allows processing all 59K files without the 1000-file sync limit
 
     // ========================================
     // Lambda Execution Role
@@ -470,7 +445,7 @@ Focus on delivering precise historical information with proper citations from th
       })
     );
 
-    // Grant Bedrock Agent permissions (for KB sync)
+    // Grant Bedrock Agent permissions (for KB sync and data source updates)
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -478,6 +453,9 @@ Focus on delivering precise historical information with proper citations from th
           "bedrock:StartIngestionJob",
           "bedrock:GetIngestionJob",
           "bedrock:ListIngestionJobs",
+          "bedrock:GetDataSource",
+          "bedrock:UpdateDataSource",  // Required to update S3 prefix
+          "bedrock:ListDataSources",
         ],
         resources: ["*"],
       })
@@ -908,14 +886,23 @@ frontend:
       exportName: `${projectName}-fargate-task`,
     });
 
+    new cdk.CfnOutput(this, "DataSourceIds", {
+      value: JSON.stringify({
+        bills: billsDataSourceId,
+        newspapers: newspapersDataSourceId,
+      }),
+      description: "Data source IDs (bills: static, newspapers: rotating prefix)",
+      exportName: `${projectName}-data-source-ids`,
+    });
+
     new cdk.CfnOutput(this, "DataSourcePrefixes", {
       value: JSON.stringify({
         bills: `s3://${dataBucket.bucketName}/bills/`,
-        newspapers_batch1: `s3://${dataBucket.bucketName}/newspapers/batch-1/`,
-        newspapers_batch2: `s3://${dataBucket.bucketName}/newspapers/batch-2/`,
-        newspapers_batch3: `s3://${dataBucket.bucketName}/newspapers/batch-3/`,
+        newspapers: `s3://${dataBucket.bucketName}/newspapers/`,
+        ingestion_method: "Direct Ingestion API (IngestKnowledgeBaseDocuments)",
+        note: "Newspapers ingested file-by-file, no 1000-file limit",
       }),
-      description: "S3 prefixes for all 4 data sources (1 bills + 3 newspaper batches)",
+      description: "S3 prefixes for data sources (newspapers use Direct Ingestion API)",
     });
 
     new cdk.CfnOutput(this, "BedrockModelId", {

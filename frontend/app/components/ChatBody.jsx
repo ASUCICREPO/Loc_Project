@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from "react"
 import { Send as SendIcon } from "@mui/icons-material"
 import Image from "next/image"
 import UserReply from "./UserReply"
+import BotReply from "./BotReply"
 
 function ChatBody({ currentLanguage }) {
   const [messages, setMessages] = useState([
@@ -179,7 +180,15 @@ function ChatBody({ currentLanguage }) {
             <div key={message.id || index}>
               {message.type === 'bot' && (
                 <div className="font-['Inter:Regular',sans-serif] text-[14px] text-black leading-[1.35]">
-                  {message.content}
+                  {typeof message.content === 'string' ? (
+                    <BotReply 
+                      message={message.content} 
+                      sources={message.sources || []}
+                      currentLanguage={currentLanguage}
+                    />
+                  ) : (
+                    message.content
+                  )}
                 </div>
               )}
               {message.type === 'user' && (

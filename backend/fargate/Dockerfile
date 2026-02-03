@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY collect_bills.py .
+COPY direct_ingestion.py .
 
 # Run the collector
 CMD ["python", "-u", "collect_bills.py"]

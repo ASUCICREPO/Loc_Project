@@ -120,159 +120,72 @@ def lambda_handler(event, context):
 def get_persona_prompt(persona: str) -> str:
     """
     Get system prompt based on user persona
+    All prompts enforce strict adherence to provided documents only
     """
     prompts = {
-        'congressional_staffer': """You are an expert constitutional research assistant for Congressional staff. 
+        'congressional_staffer': """You are an expert constitutional research assistant for Congressional staff.
+
+CRITICAL RULE: Answer ONLY using information from the provided documents. Do NOT use your general knowledge.
+
 Your responses should be:
-- Precise and authoritative with specific citations
-- Focused on precedent and constitutional interpretation
-- Include relevant Federalist Papers references when applicable
-- Provide historical context for legislative decisions
+- Precise and authoritative with specific citations from the documents
+- Focused on precedent and constitutional interpretation found in the documents
+- Include relevant references when they appear in the documents
+- Provide historical context ONLY from the documents
 - Use formal, professional language suitable for briefing members of Congress
-- Cite specific articles, sections, and amendments
-- Reference relevant Supreme Court cases with case names and years""",
+- If information is not in the documents, clearly state: "This information is not available in the provided documents."
+""",
         
         'research_journalist': """You are a constitutional expert helping journalists research stories.
+
+CRITICAL RULE: Answer ONLY using information from the provided documents. Do NOT use your general knowledge.
+
 Your responses should be:
-- Provide cultural and historical context from the era
-- Explain constitutional language in accessible terms
-- Connect constitutional provisions to modern relevance
-- Include interesting historical anecdotes and context
-- Explain the "why" behind constitutional decisions
-- Reference the social and political climate of the time
-- Use clear, engaging language suitable for news articles""",
+- Provide cultural and historical context ONLY from the documents
+- Explain constitutional language using information in the documents
+- Include interesting historical details ONLY if they appear in the documents
+- Use clear, engaging language suitable for news articles
+- If information is not in the documents, clearly state: "This information is not available in the provided documents."
+""",
         
         'law_student': """You are a constitutional law professor helping students learn.
+
+CRITICAL RULE: Answer ONLY using information from the provided documents. Do NOT use your general knowledge.
+
 Your responses should be:
-- Educational and comprehensive
-- Explain legal reasoning and constitutional theory
-- Trace the evolution of constitutional interpretation
-- Reference landmark cases with detailed analysis
-- Explain both majority and dissenting opinions
-- Connect constitutional provisions to broader legal principles
-- Use precise legal terminology with explanations
-- Encourage critical thinking about constitutional questions""",
+- Educational and comprehensive using ONLY the provided documents
+- Explain legal reasoning found in the documents
+- Reference cases and provisions ONLY if they appear in the documents
+- Use precise legal terminology from the documents
+- If information is not in the documents, clearly state: "This information is not available in the provided documents."
+""",
         
         'general': """You are a knowledgeable constitutional expert.
+
+CRITICAL RULE: Answer ONLY using information from the provided documents. Do NOT use your general knowledge.
+
 Your responses should be:
-- Clear and informative
-- Balanced and objective
-- Include relevant historical context
-- Cite specific constitutional provisions
-- Reference important court cases when relevant
-- Use accessible language while maintaining accuracy"""
+- Clear and informative using ONLY the provided documents
+- Balanced and objective based on the documents
+- Include relevant historical context ONLY from the documents
+- Cite specific provisions ONLY if they appear in the documents
+- If information is not in the documents, clearly state: "This information is not available in the provided documents."
+"""
     }
     
     return prompts.get(persona, prompts['general'])
 
 
-def extract_bill_info(question: str) -> dict:
-    """
-    Extract bill information from user question for metadata filtering
-    
-    Examples:
-    - "what is bill HR 1 in congress 6?" -> {"congress": "6", "bill_type": "HR", "bill_number": "1"}
-    - "show me bill S 2 from congress 16" -> {"congress": "16", "bill_type": "S", "bill_number": "2"}
-    - "tell me about HR1 congress 6" -> {"congress": "6", "bill_type": "HR", "bill_number": "1"}
-    """
-    import re
-    
-    # Normalize question to lowercase for pattern matching
-    q = question.lower()
-    
-    bill_info = {}
-    
-    # Pattern 1: "bill HR 1 in congress 6" or "bill HR1 congress 6"
-    pattern1 = r'bill\s+([a-z]+)\s*(\d+).*congress\s+(\d+)'
-    match1 = re.search(pattern1, q)
-    if match1:
-        bill_info = {
-            "bill_type": match1.group(1).upper(),
-            "bill_number": match1.group(2),
-            "congress": match1.group(3)
-        }
-    
-    # Pattern 2: "HR 1 from congress 6" or "S2 congress 16"
-    pattern2 = r'([a-z]+)\s*(\d+).*congress\s+(\d+)'
-    match2 = re.search(pattern2, q)
-    if match2 and not match1:  # Only if pattern1 didn't match
-        bill_info = {
-            "bill_type": match2.group(1).upper(),
-            "bill_number": match2.group(2),
-            "congress": match2.group(3)
-        }
-    
-    # Pattern 3: "congress 6 bill HR 1"
-    pattern3 = r'congress\s+(\d+).*bill\s+([a-z]+)\s*(\d+)'
-    match3 = re.search(pattern3, q)
-    if match3 and not match1 and not match2:
-        bill_info = {
-            "congress": match3.group(1),
-            "bill_type": match3.group(2).upper(),
-            "bill_number": match3.group(3)
-        }
-    
-    print(f"Extracted bill info from '{question}': {bill_info}")
-    return bill_info
-
-
-def build_metadata_filter(bill_info: dict) -> dict:
-    """
-    Build metadata filter for Knowledge Base using mapped S3 metadata attributes
-    Now that we have proper metadata mapping, these filters will work
-    """
-    if not bill_info:
-        return None
-    
-    filters = []
-    
-    # Add congress filter (now mapped to KB metadata)
-    if 'congress' in bill_info:
-        filters.append({
-            "equals": {
-                "key": "congress",
-                "value": bill_info['congress']
-            }
-        })
-    
-    # Add bill type filter
-    if 'bill_type' in bill_info:
-        filters.append({
-            "equals": {
-                "key": "bill_type", 
-                "value": bill_info['bill_type']
-            }
-        })
-    
-    # Add bill number filter
-    if 'bill_number' in bill_info:
-        filters.append({
-            "equals": {
-                "key": "bill_number",
-                "value": bill_info['bill_number']
-            }
-        })
-    
-    # Combine all filters with AND logic
-    if len(filters) == 1:
-        return filters[0]
-    elif len(filters) > 1:
-        return {"andAll": filters}
-    
-    return None
-
-
-
-
-
 def query_knowledge_base(question: str, persona: str = 'general') -> dict:
     """
-    Query Knowledge Base - handles both specific bill queries and general questions
+    Query Knowledge Base using two-step approach for reliable citations
+    Step 1: retrieve() - Get explicit document references
+    Step 2: Use those documents to generate answer with proper citations
+    
+    Note: Metadata filtering is not currently configured in the Knowledge Base.
+    All queries search across all documents (bills + newspapers).
     """
     print(f"Querying Knowledge Base: {KNOWLEDGE_BASE_ID}")
-    
-    # Extract bill information for potential filtering
-    bill_info = extract_bill_info(question)
     
     # Get AWS context
     aws_region = os.environ.get("AWS_REGION", "us-east-1")
@@ -280,6 +193,133 @@ def query_knowledge_base(question: str, persona: str = 'general') -> dict:
     account_id = sts_client.get_caller_identity()['Account']
     
     try:
+        # Build retrieval configuration
+        # Search all documents - no metadata filtering
+        retrieval_config = {
+            'vectorSearchConfiguration': {
+                'numberOfResults': 20,
+                'overrideSearchType': 'SEMANTIC'
+            }
+        }
+        
+        print("General query - searching all documents")
+        
+        # STEP 1: Retrieve documents explicitly
+        print(f"Step 1: Retrieving documents...")
+        retrieve_response = bedrock_agent_runtime.retrieve(
+            knowledgeBaseId=KNOWLEDGE_BASE_ID,
+            retrievalQuery={'text': question},
+            retrievalConfiguration=retrieval_config
+        )
+        
+        print(f"Retrieved {len(retrieve_response.get('retrievalResults', []))} documents")
+        
+        # Extract sources from retrieve response
+        sources = []
+        retrieved_docs = []
+        
+        for result in retrieve_response.get('retrievalResults', []):
+            # Build source info
+            location = result.get('location', {}).get('s3Location', {})
+            content_text = result.get('content', {}).get('text', '')
+            metadata = result.get('metadata', {})
+            
+            # Extract original URL from unified metadata field
+            # This is the actual source URL (congress.gov or chroniclingamerica.loc.gov), not S3 path
+            original_url = metadata.get('source_url', '')
+            
+            # Determine document type and title
+            entity_type = metadata.get('entity_type', 'document')
+            
+            if entity_type == 'bill':
+                # For bills, create a descriptive title
+                congress = metadata.get('congress', '')
+                bill_type = metadata.get('bill_type', '')
+                bill_number = metadata.get('bill_number', '')
+                title = f"Congress {congress} - {bill_type} {bill_number}" if congress else "Congressional Bill"
+                doc_type = "Bill"
+            elif entity_type == 'newspaper':
+                # For newspapers, use newspaper title and date
+                newspaper_title = metadata.get('newspaper_title', '')
+                issue_date = metadata.get('issue_date', '')
+                
+                # Fallback: extract from filename if metadata is missing
+                if not newspaper_title:
+                    # Filename format: newspaper_15695_1809-06-13_The Kentucky Gazette.txt
+                    uri = location.get('uri', '')
+                    filename = uri.split('/')[-1].replace('.txt', '')
+                    parts = filename.split('_', 3)  # Split into max 4 parts
+                    if len(parts) >= 4:
+                        newspaper_title = parts[3]  # The newspaper name
+                    if len(parts) >= 3 and not issue_date:
+                        issue_date = parts[2]  # The date
+                
+                title = f"{newspaper_title} ({issue_date})" if (newspaper_title and issue_date) else (newspaper_title or "Historical Newspaper")
+                doc_type = "Newspaper"
+            else:
+                # Fallback: try to extract info from S3 URI
+                uri = location.get('uri', '')
+                filename = uri.split('/')[-1].replace('.txt', '')
+                
+                # Check if it's a newspaper file (starts with "newspaper_")
+                if filename.startswith('newspaper_'):
+                    parts = filename.split('_', 3)
+                    if len(parts) >= 4:
+                        newspaper_title = parts[3]
+                        issue_date = parts[2] if len(parts) >= 3 else ''
+                        title = f"{newspaper_title} ({issue_date})" if issue_date else newspaper_title
+                        doc_type = "Newspaper"
+                    else:
+                        title = "Historical Newspaper"
+                        doc_type = "Newspaper"
+                else:
+                    title = "Historical Document"
+                    doc_type = "Document"
+            
+            source_info = {
+                'document_id': location.get('uri', ''),  # S3 path (for internal tracking)
+                'url': original_url if original_url else location.get('uri', ''),  # Original URL for display
+                'title': title,
+                'type': doc_type,
+                'content': content_text[:300] + '...' if len(content_text) > 300 else content_text,
+                'score': result.get('score', 0),
+                'metadata': {
+                    'entity_type': entity_type,
+                    'congress': metadata.get('congress', ''),
+                    'bill_type': metadata.get('bill_type', ''),
+                    'bill_number': metadata.get('bill_number', ''),
+                    'newspaper_title': metadata.get('newspaper_title', ''),
+                    'issue_date': metadata.get('issue_date', ''),
+                    'year': metadata.get('year', ''),
+                    'source': metadata.get('source', '')
+                }
+            }
+            sources.append(source_info)
+            
+            # Keep full content for generation
+            retrieved_docs.append({
+                'uri': location.get('uri', ''),
+                'content': content_text
+            })
+            
+            print(f"  Source: {title}")
+            print(f"    Type: {doc_type}")
+            print(f"    URL: {source_info['url'][:80]}...")
+            print(f"    Score: {source_info['score']:.3f}")
+        
+        # Check if we found any documents
+        if len(sources) == 0:
+            print("⚠️ WARNING: No documents found in Knowledge Base")
+            return {
+                'answer': "I don't have access to the historical documents yet. The Knowledge Base may still be syncing or needs to be populated with data. Please try again later or contact support.",
+                'sources': [],
+                'entities': [],
+                'warning': 'no_sources_found'
+            }
+        
+        # STEP 2: Generate answer using retrieved documents
+        print(f"Step 2: Generating answer from {len(retrieved_docs)} documents...")
+        
         # Determine model ARN
         if BEDROCK_MODEL_ID.startswith(('us.', 'eu.', 'global.')):
             model_arn = f'arn:aws:bedrock:{aws_region}:{account_id}:inference-profile/{BEDROCK_MODEL_ID}'
@@ -289,23 +329,8 @@ def query_knowledge_base(question: str, persona: str = 'general') -> dict:
         # Get persona-specific system prompt
         system_prompt = get_persona_prompt(persona)
         
-        # Build retrieval configuration
-        retrieval_config = {
-            'vectorSearchConfiguration': {
-                'numberOfResults': 50,
-                'overrideSearchType': 'SEMANTIC'
-            }
-        }
-        
-        # Add metadata filter only if specific bill is detected
-        metadata_filter = build_metadata_filter(bill_info)
-        if metadata_filter:
-            retrieval_config['vectorSearchConfiguration']['filter'] = metadata_filter
-            print(f"Specific bill detected - applying metadata filter for precise targeting")
-        else:
-            print("General query - searching all documents")
-        
-        # Build the configuration
+        # Now use retrieve_and_generate with the same query
+        # This will use the same documents but return a generated answer
         retrieve_and_generate_config = {
             'type': 'KNOWLEDGE_BASE',
             'knowledgeBaseConfiguration': {
@@ -315,14 +340,19 @@ def query_knowledge_base(question: str, persona: str = 'general') -> dict:
                     'promptTemplate': {
                         'textPromptTemplate': f"""{system_prompt}
 
-Use the following context to answer the question. Provide a well-formatted response.
+CRITICAL INSTRUCTIONS:
+1. You MUST answer ONLY using information from the Context provided below
+2. If the Context does not contain the answer, you MUST respond with: "I cannot find information about this in the available documents."
+3. DO NOT use your general knowledge or training data
+4. DO NOT make assumptions beyond what is explicitly stated in the Context
+5. DO NOT provide information that is not in the Context, even if you know it from your training
 
-Context:
+Context from Historical Documents:
 $search_results$
 
 Question: $query$
 
-Answer:"""
+Answer (using ONLY the Context above):"""
                     },
                     'inferenceConfig': {
                         'textInferenceConfig': {
@@ -335,69 +365,27 @@ Answer:"""
             }
         }
         
-        # Query Knowledge Base
-        print(f"Calling retrieve_and_generate with config: {json.dumps(retrieve_and_generate_config, indent=2)}")
-        
         response = bedrock_agent_runtime.retrieve_and_generate(
             input={'text': question},
             retrieveAndGenerateConfiguration=retrieve_and_generate_config
         )
         
-        print(f"Raw Knowledge Base response: {json.dumps(response, indent=2, default=str)}")
-        
-        # Extract answer and sources
+        # Extract answer
         answer = response['output']['text']
-        print(f"Extracted answer: {answer}")
+        print(f"Generated answer: {answer[:200]}...")
         
-        sources = []
-        
-        if 'citations' in response:
-            print(f"Found {len(response['citations'])} citations")
-            for i, citation in enumerate(response['citations']):
-                print(f"Citation {i}: {json.dumps(citation, indent=2, default=str)}")
-                retrieved_refs = citation.get('retrievedReferences', [])
-                for j, reference in enumerate(retrieved_refs):
-                    print(f"  Reference {j}: {json.dumps(reference, indent=2, default=str)}")
-                    source_info = {
-                        'document_id': reference.get('location', {}).get('s3Location', {}).get('uri', ''),
-                        'content': reference.get('content', {}).get('text', '')[:200] + '...',
-                        'score': reference.get('score', 0),
-                        'title': reference.get('metadata', {}).get('title', ''),
-                        'url': reference.get('location', {}).get('s3Location', {}).get('uri', '')
-                    }
-                    sources.append(source_info)
-                    print(f"  Processed source: {source_info}")
-        else:
-            print("No citations found in response")
-        
-        # PREVENT HALLUCINATION: If no sources found, return appropriate message
-        if len(sources) == 0:
-            print("⚠️ WARNING: No sources found - Knowledge Base may be empty or not synced")
-            return {
-                'answer': "I don't have access to the historical documents yet. The Knowledge Base may still be syncing or needs to be populated with data. Please try again later or contact support.",
-                'sources': [],
-                'entities': [],
-                'warning': 'no_sources_found'
-            }
-        
-        # Extract entities
-        entities = []
-        if 'metadata' in response:
-            entities = response['metadata'].get('entities', [])
-            print(f"Found {len(entities)} entities: {entities}")
-        else:
-            print("No metadata found in response")
-        
-        print(f"✓ Knowledge Base returned answer with {len(sources)} sources and {len(entities)} entities")
+        print(f"✓ Knowledge Base returned answer with {len(sources)} sources")
         
         return {
             'answer': answer,
-            'sources': sources,
-            'entities': entities
+            'sources': sources,  # Use sources from retrieve() step
+            'entities': []
         }
         
     except Exception as e:
         print(f"ERROR querying Knowledge Base: {str(e)}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
         return {
             'answer': "I encountered an error while searching. Please try again.",
             'sources': [],
