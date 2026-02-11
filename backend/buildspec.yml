@@ -15,6 +15,9 @@ phases:
     commands:
       - echo "Building TypeScript..."
       - npm run build
+      - echo "Setting up AgentCore Memory..."
+      - pip install bedrock-agentcore -q || echo "Failed to install bedrock-agentcore, continuing..."
+      - python scripts/create_memory.py || echo "Memory setup failed, continuing without memory..."
       - echo "Bootstrapping CDK..."
       - cdk bootstrap --require-approval never
 

@@ -9,6 +9,8 @@
     "build": "tsc",
     "watch": "tsc -w",
     "cdk": "cdk",
+    "setup-memory": "python scripts/create_memory.py",
+    "predeploy": "npm run setup-memory",
     "deploy": "cdk deploy --all",
     "destroy": "cdk destroy --all"
   },

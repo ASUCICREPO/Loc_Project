@@ -32,6 +32,19 @@ function ChatBody({ currentLanguage }) {
   const [inputValue, setInputValue] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [isTyping, setIsTyping] = useState(false)
+  const [sessionId, setSessionId] = useState(() => {
+    // Generate unique session ID for this conversation
+    return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+  })
+  const [userId] = useState(() => {
+    // Get or create persistent user ID
+    if (typeof window === 'undefined') return 'anonymous'
+    const stored = localStorage.getItem('histora_user_id')
+    if (stored) return stored
+    const newId = `user-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+    localStorage.setItem('histora_user_id', newId)
+    return newId
+  })
   const messagesEndRef = useRef(null)
   const chatContainerRef = useRef(null)
 
@@ -118,6 +131,8 @@ function ChatBody({ currentLanguage }) {
           message: messageToSend,
           persona: selectedPersona,
           language: currentLanguage,
+          user_id: userId,
+          session_id: sessionId,
         }),
       })
 
@@ -126,6 +141,11 @@ function ChatBody({ currentLanguage }) {
       }
 
       const data = await response.json()
+      
+      // Update session ID if server returns one
+      if (data.session_id) {
+        setSessionId(data.session_id)
+      }
       
       setIsTyping(false)
       setMessages(prev => [...prev, { 

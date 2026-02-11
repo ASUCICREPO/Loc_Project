@@ -461,12 +461,13 @@ Focus on delivering precise historical information with proper citations from th
       })
     );
 
-    // Grant Bedrock model invocation permissions (for chat)
+    // Grant Bedrock model invocation permissions (for chat and Strands streaming)
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: [
           "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",  // For Strands streaming
           "bedrock:Retrieve",
           "bedrock:RetrieveAndGenerate",
           "bedrock:GetInferenceProfile",
@@ -633,12 +634,37 @@ Focus on delivering precise historical information with proper citations from th
       sourceAccount: this.account,
     });
 
-    // 4. Chat Handler Lambda
+    // 4. Chat Handler Lambda with Strands Agent
+    // AgentCore Memory ID - automatically set by predeploy script
+    // The script runs before deployment and saves the ID to cdk.context.json
+    const agentCoreMemoryId = this.node.tryGetContext('agentcore-memory-id') || "";
+    
+    if (!agentCoreMemoryId) {
+      console.warn("⚠️  AgentCore Memory ID not found. Run 'npm run setup-memory' first.");
+      console.warn("   Chat will work but without conversation history.");
+    }
+
     const chatHandlerLogGroup = new logs.LogGroup(this, "ChatHandlerLogGroup", {
       logGroupName: `/aws/lambda/${projectName}-chat-handler`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+
+    // Add AgentCore permissions to Lambda role
+    lambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "bedrock-agentcore:CreateEvent",
+          "bedrock-agentcore:ListEvents",
+          "bedrock-agentcore:RetrieveMemories",
+          "bedrock-agentcore:RetrieveMemoryRecords",  // Required for memory retrieval
+          "bedrock-agentcore:GetMemory",
+          "bedrock-agentcore:GetMemoryStrategies",
+        ],
+        resources: ["*"],
+      })
+    );
 
     const chatHandlerFunction = new lambda.Function(
       this,
@@ -648,15 +674,26 @@ Focus on delivering precise historical information with proper citations from th
         runtime: lambda.Runtime.PYTHON_3_11,
         handler: "lambda_function.lambda_handler",
         code: lambda.Code.fromAsset(
-          path.join(__dirname, "../lambda/chat-handler")
+          path.join(__dirname, "../lambda/chat-handler"),
+          {
+            bundling: {
+              image: lambda.Runtime.PYTHON_3_11.bundlingImage,
+              command: [
+                "bash",
+                "-c",
+                "pip install -r requirements.txt -t /asset-output && cp -au . /asset-output",
+              ],
+            },
+          }
         ),
-        timeout: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(60), // Increased for Strands Agent
         memorySize: 1024,
         role: lambdaRole,
         environment: {
-          KNOWLEDGE_BASE_ID: knowledgeBaseId, // Will be updated by CLI
+          KNOWLEDGE_BASE_ID: knowledgeBaseId,
           MODEL_ID: bedrockModelId,
-          DATA_BUCKET_NAME: dataBucket.bucketName, // For direct S3 access
+          DATA_BUCKET_NAME: dataBucket.bucketName,
+          AGENTCORE_MEMORY_ID: agentCoreMemoryId, // Set from cdk.context.json
         },
         logGroup: chatHandlerLogGroup,
       }
@@ -914,6 +951,12 @@ frontend:
       value: kbTransformationFunction.functionArn,
       description: "Transformation Lambda ARN for Knowledge Base GraphRAG",
       exportName: `${projectName}-kb-transformation-arn`,
+    });
+
+    new cdk.CfnOutput(this, "AgentCoreMemoryId", {
+      value: agentCoreMemoryId,
+      description: "AgentCore Memory ID for conversation history",
+      exportName: `${projectName}-memory-id`,
     });
 
     // ========================================
