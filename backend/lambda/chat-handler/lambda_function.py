@@ -44,6 +44,145 @@ _current_sources = []
 
 
 # =============================================================================
+# HELPER FUNCTIONS FOR METADATA FILTERING
+# =============================================================================
+
+def extract_filters_from_query(query: str) -> dict:
+    """
+    Extract metadata filters from the user's query.
+    Detects years, congress numbers, and document types.
+    
+    Available metadata fields:
+    - entity_type: "bill" or "newspaper"
+    - year: e.g., "1793", "1798"
+    - congress: congress number e.g., "1", "5", "16"
+    - bill_type: "HR", "S", "HJRES", etc.
+    - newspaper_title: newspaper name
+    - issue_date: date string
+    """
+    filters = {}
+    query_lower = query.lower()
+    
+    # Extract year (4-digit number between 1770-1830)
+    year_match = re.search(r'\b(17[7-9]\d|18[0-2]\d)\b', query)
+    if year_match:
+        filters['year'] = year_match.group(1)
+    
+    # Extract congress number
+    # Patterns: "5th congress", "congress 5", "fifth congress", etc.
+    congress_patterns = [
+        r'(\d+)(?:st|nd|rd|th)?\s*congress',
+        r'congress\s*(\d+)',
+        r'(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth)\s*congress'
+    ]
+    
+    ordinal_map = {
+        'first': '1', 'second': '2', 'third': '3', 'fourth': '4', 'fifth': '5',
+        'sixth': '6', 'seventh': '7', 'eighth': '8', 'ninth': '9', 'tenth': '10',
+        'eleventh': '11', 'twelfth': '12', 'thirteenth': '13', 'fourteenth': '14',
+        'fifteenth': '15', 'sixteenth': '16'
+    }
+    
+    for pattern in congress_patterns:
+        match = re.search(pattern, query_lower)
+        if match:
+            congress_val = match.group(1)
+            if congress_val in ordinal_map:
+                filters['congress'] = ordinal_map[congress_val]
+            else:
+                filters['congress'] = congress_val
+            break
+    
+    # If year is provided but no congress, calculate approximate congress
+    # Congress 1 = 1789-1791, Congress 2 = 1791-1793, etc.
+    if 'year' in filters and 'congress' not in filters:
+        year = int(filters['year'])
+        if year >= 1789:
+            approx_congress = ((year - 1789) // 2) + 1
+            if 1 <= approx_congress <= 16:
+                filters['congress'] = str(approx_congress)
+    
+    # Detect document type preference
+    if any(word in query_lower for word in ['bill', 'legislation', 'act', 'law', 'congress', 'senate', 'house']):
+        filters['entity_type'] = 'bill'
+    elif any(word in query_lower for word in ['newspaper', 'news', 'article', 'press', 'gazette']):
+        filters['entity_type'] = 'newspaper'
+    
+    # Detect bill type
+    bill_type_patterns = {
+        'HR': r'\b(h\.?r\.?|house\s*resolution|house\s*bill)\b',
+        'S': r'\b(s\.?\s*\d|senate\s*bill)\b',
+        'HJRES': r'\b(h\.?j\.?\s*res|house\s*joint\s*resolution)\b',
+        'SJRES': r'\b(s\.?j\.?\s*res|senate\s*joint\s*resolution)\b',
+    }
+    
+    for bill_type, pattern in bill_type_patterns.items():
+        if re.search(pattern, query_lower):
+            filters['bill_type'] = bill_type
+            filters['entity_type'] = 'bill'
+            break
+    
+    return filters
+
+
+def build_retrieval_filter(filters: dict) -> dict:
+    """
+    Build Bedrock Knowledge Base filter from extracted filters.
+    Uses the filter syntax for Bedrock KB retrieve API.
+    """
+    if not filters:
+        return None
+    
+    filter_conditions = []
+    
+    # Year filter (exact match)
+    if 'year' in filters:
+        filter_conditions.append({
+            'equals': {
+                'key': 'year',
+                'value': filters['year']
+            }
+        })
+    
+    # Congress filter (exact match)
+    if 'congress' in filters:
+        filter_conditions.append({
+            'equals': {
+                'key': 'congress',
+                'value': filters['congress']
+            }
+        })
+    
+    # Entity type filter
+    if 'entity_type' in filters:
+        filter_conditions.append({
+            'equals': {
+                'key': 'entity_type',
+                'value': filters['entity_type']
+            }
+        })
+    
+    # Bill type filter
+    if 'bill_type' in filters:
+        filter_conditions.append({
+            'equals': {
+                'key': 'bill_type',
+                'value': filters['bill_type']
+            }
+        })
+    
+    # Combine filters with AND
+    if len(filter_conditions) == 0:
+        return None
+    elif len(filter_conditions) == 1:
+        return filter_conditions[0]
+    else:
+        return {
+            'andAll': filter_conditions
+        }
+
+
+# =============================================================================
 # KNOWLEDGE BASE TOOL
 # =============================================================================
 
@@ -51,6 +190,7 @@ _current_sources = []
 def search_historical_documents(query: str) -> str:
     """Search Library of Congress historical documents, congressional bills, and newspapers.
     Use this tool to find information about constitutional history, legislation, and historical events.
+    Returns the document content which you should use to answer the user's question.
     
     Args:
         query: The search query about historical documents, bills, amendments, or newspapers
@@ -62,10 +202,12 @@ def search_historical_documents(query: str) -> str:
     
     logger.info(f"Searching Knowledge Base for: {query}")
     
+    # Extract metadata filters from query
+    filters = extract_filters_from_query(query)
+    if filters:
+        logger.info(f"Extracted filters: {filters}")
+    
     try:
-        # Get AWS account ID for model ARN
-        account_id = sts_client.get_caller_identity()['Account']
-        
         # Build retrieval configuration
         retrieval_config = {
             'vectorSearchConfiguration': {
@@ -74,7 +216,13 @@ def search_historical_documents(query: str) -> str:
             }
         }
         
-        # Step 1: Retrieve documents
+        # Add metadata filter if we extracted any
+        kb_filter = build_retrieval_filter(filters)
+        if kb_filter:
+            retrieval_config['vectorSearchConfiguration']['filter'] = kb_filter
+            logger.info(f"Applied KB filter: {kb_filter}")
+        
+        # Retrieve documents with filters
         retrieve_response = bedrock_agent_runtime.retrieve(
             knowledgeBaseId=KNOWLEDGE_BASE_ID,
             retrievalQuery={'text': query},
@@ -82,14 +230,28 @@ def search_historical_documents(query: str) -> str:
         )
         
         results = retrieve_response.get('retrievalResults', [])
-        logger.info(f"Retrieved {len(results)} documents")
+        logger.info(f"Retrieved {len(results)} documents with filters")
+        
+        # If no results with filters, try without filters as fallback
+        if not results and kb_filter:
+            logger.info("No results with filters, retrying without filters...")
+            retrieval_config['vectorSearchConfiguration'].pop('filter', None)
+            retrieve_response = bedrock_agent_runtime.retrieve(
+                knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                retrievalQuery={'text': query},
+                retrievalConfiguration=retrieval_config
+            )
+            results = retrieve_response.get('retrievalResults', [])
+            logger.info(f"Retrieved {len(results)} documents without filters")
         
         if not results:
             return "No relevant documents found in the historical archives."
         
-        # Extract sources for frontend
+        # Extract sources for frontend and build context for agent
         sources = []
-        for result in results:
+        document_context = []
+        
+        for i, result in enumerate(results):  # Use all retrieved documents for context
             location = result.get('location', {}).get('s3Location', {})
             content_text = result.get('content', {}).get('text', '')
             metadata = result.get('metadata', {})
@@ -131,53 +293,24 @@ def search_historical_documents(query: str) -> str:
                     'source': metadata.get('source', '')
                 }
             })
+            
+            # Build context for agent to use
+            document_context.append(f"[Document {i+1}: {title}]\n{content_text[:1500]}")
         
-        # Store sources globally for response
-        _current_sources = sources
+        # Accumulate sources globally for response (don't overwrite, append and dedupe)
+        existing_urls = {s['url'] for s in _current_sources}
+        for source in sources:
+            if source['url'] not in existing_urls:
+                _current_sources.append(source)
+                existing_urls.add(source['url'])
         
-        # Step 2: Generate answer using retrieve_and_generate
-        if BEDROCK_MODEL_ID.startswith(('us.', 'eu.', 'global.')):
-            model_arn = f'arn:aws:bedrock:{AWS_REGION}:{account_id}:inference-profile/{BEDROCK_MODEL_ID}'
-        else:
-            model_arn = f'arn:aws:bedrock:{AWS_REGION}::foundation-model/{BEDROCK_MODEL_ID}'
-        
-        retrieve_and_generate_config = {
-            'type': 'KNOWLEDGE_BASE',
-            'knowledgeBaseConfiguration': {
-                'knowledgeBaseId': KNOWLEDGE_BASE_ID,
-                'modelArn': model_arn,
-                'generationConfiguration': {
-                    'promptTemplate': {
-                        'textPromptTemplate': """Answer the question using ONLY the context provided below.
-If the information is not in the context, say "I cannot find this information in the available documents."
+        # Return document content for Strands Agent to use (NO second LLM call)
+        context = "\n\n---\n\n".join(document_context)
+        return f"""Found {len(results)} relevant documents. Here are the most relevant excerpts:
 
-Context from Historical Documents:
-$search_results$
+{context}
 
-Question: $query$
-
-Answer:"""
-                    },
-                    'inferenceConfig': {
-                        'textInferenceConfig': {
-                            'temperature': 0.1,
-                            'maxTokens': 2000
-                        }
-                    }
-                },
-                'retrievalConfiguration': retrieval_config
-            }
-        }
-        
-        response = bedrock_agent_runtime.retrieve_and_generate(
-            input={'text': query},
-            retrieveAndGenerateConfiguration=retrieve_and_generate_config
-        )
-        
-        answer = response['output']['text']
-        logger.info(f"Generated answer: {answer[:100]}...")
-        
-        return answer
+Use ONLY the information above to answer the user's question. If the answer is not in these documents, say so."""
         
     except Exception as e:
         logger.error(f"Error searching Knowledge Base: {e}")
@@ -313,41 +446,58 @@ def get_system_prompt(persona: str) -> str:
     base_prompt = """You are Histora, an AI assistant for the Library of Congress.
 You help users explore historical documents, congressional bills, and newspaper archives.
 
-IMPORTANT RULES:
-1. Use the search_historical_documents tool to find information
-2. Answer ONLY using information from the documents returned by the tool
-3. If you cannot find information, say so clearly
-4. Always be helpful and provide context when available
+ABSOLUTE RULES - NEVER VIOLATE THESE:
+1. You MUST ALWAYS call the search_historical_documents tool for EVERY question - even if you think you know the answer
+2. You can ONLY answer using information that appears in the documents returned by the tool
+3. You are FORBIDDEN from using your pre-trained knowledge, general knowledge, or any information not in the retrieved documents
+4. You are FORBIDDEN from making up, inferring, or supplementing information beyond what's in the documents
+5. If the documents don't contain the answer, you MUST say: "I couldn't find information about [topic] in the available historical archives."
+6. Make at most 2-3 search attempts before concluding
+
+IMPORTANT ABOUT PREVIOUS CONTEXT:
+- Previous Context is ONLY for understanding conversation flow (e.g., what "it" refers to)
+- You MUST NOT use Previous Context as a source of facts or answers
+- Even if Previous Context mentions an answer, you MUST search the Knowledge Base to verify
+- ALWAYS call search_historical_documents - do not skip it because of Previous Context
+
+WHAT YOU MUST NEVER DO:
+- NEVER answer without first calling search_historical_documents
+- NEVER provide historical facts from Previous Context without verifying via search
+- NEVER say "Based on previous context" and then give an answer
+- NEVER provide historical facts, dates, names, or events from your training data
+- NEVER fill in gaps with general knowledge
+
+RESPONSE FORMAT:
+- FIRST: Always call search_historical_documents
+- THEN: If you found relevant documents, quote or paraphrase directly from them
+- If documents don't contain the answer: Say "I couldn't find this in the available archives"
+- DO NOT mention your search process or tool calls in your response
 """
     
     persona_additions = {
         'congressional_staffer': """
 You are assisting Congressional staff with research.
-- Be precise and authoritative
-- Focus on precedent and constitutional interpretation
+- Be precise and cite specific documents
+- Only reference what's in the retrieved documents
 - Use formal, professional language
-- Cite specific documents when possible
 """,
         'research_journalist': """
 You are helping journalists research stories.
-- Provide cultural and historical context
-- Explain constitutional language clearly
-- Use engaging language suitable for articles
-- Highlight interesting historical details
+- Only provide context found in the documents
+- Quote directly from historical sources when possible
+- Be clear about what the archives do and don't contain
 """,
         'law_student': """
-You are a constitutional law professor helping students.
-- Be educational and comprehensive
-- Explain legal reasoning clearly
-- Use precise legal terminology
-- Reference relevant cases and provisions
+You are helping law students with research.
+- Only reference cases and provisions found in the documents
+- Be educational but stick to document content
+- Clearly distinguish between what's in archives vs. not available
 """,
         'general': """
 You are helping a general user explore history.
-- Be clear and informative
-- Provide helpful context
-- Use accessible language
-- Make history engaging and interesting
+- Be clear and informative using only document content
+- If information isn't available, suggest what topics ARE in the archives
+- Make the available historical content engaging
 """
     }
     
@@ -438,13 +588,16 @@ def lambda_handler(event, context):
             hooks=hooks,
         )
         
-        # Run agent
+        # Run agent with max_turns limit to prevent timeout
         logger.info("Running Strands Agent...")
-        result = agent(question)
+        result = agent(question, max_turns=5)  # Limit to 5 turns (includes tool calls + responses)
         
         # Extract response text
         answer = str(result)
         logger.info(f"Agent response: {answer[:100]}...")
+        
+        # Sort sources by score and limit to top results
+        sorted_sources = sorted(_current_sources, key=lambda x: x.get('score', 0), reverse=True)[:20]
         
         return {
             'statusCode': 200,
@@ -455,7 +608,7 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'message': answer,
                 'answer': answer,
-                'sources': _current_sources,
+                'sources': sorted_sources,
                 'entities': [],
                 'session_id': session_id
             })
