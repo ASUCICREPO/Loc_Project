@@ -31,6 +31,10 @@ The Cultural Heritage Chatbot provides an intelligent, persona-based interface f
 
 ## Architecture
 
+![Architecture Diagram](Architechture_Diagram.png)
+
+### System Components
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         Frontend                             │
