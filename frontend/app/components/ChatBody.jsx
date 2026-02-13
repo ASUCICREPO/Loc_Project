@@ -13,19 +13,8 @@ function ChatBody({ currentLanguage }) {
       type: 'bot',
       content: (
         <div>
-          <p className="mb-0">
-            <span className="font-bold">Hi, I'm Histora — your AI assistant!</span>
-            <br />
-            <br />
-          </p>
-          <p className="mb-0">You can discover more about the formation of the United States during the American Revolution through:</p>
-          <ul className="list-disc ml-5 mt-2 mb-3">
-            <li>Constitutional history and amendments</li>
-            <li>Congressional bills and legislation</li>
-            <li>Historical newspapers and documents</li>
-            <li>Legal precedents and court cases</li>
-          </ul>
-          <p className="mb-0">To tailor the experience to your learning style, please select a persona:</p>
+          <p className="mb-0">You can discover more about the formation of the United States during the American Revolution through: Constitutional history and amendments; Congressional bills and legislation; Historical newspapers and documents; and Legal precedents and court cases.</p>
+          <p className="mb-0">To tailor responses to your needs, tell me who you are:</p>
           <p className="mb-0">&nbsp;</p>
           <p className="font-semibold mb-2">Persona descriptions:</p>
           <div className="ml-4 mb-3 space-y-2">
@@ -102,13 +91,12 @@ function ChatBody({ currentLanguage }) {
         content: (
           <div>
             <p className="mb-0">Perfect! I'm now configured for <strong>{personas[persona]}</strong> responses.</p>
-            <p className="mb-0">&nbsp;</p>
-            <p className="mb-0">You can ask me about:</p>
+            <p className="mb-0">You can ask questions in your own words. I'm especially helpful with things like:</p>
             <ul className="list-disc ml-5 mt-2">
-              <li>Constitutional history and amendments</li>
-              <li>Congressional bills and legislation</li>
-              <li>Historical newspapers and documents</li>
-              <li>Legal precedents and court cases</li>
+              <li>Explaining why a law, amendment, or case mattered at the time</li>
+              <li>Summarizing historical documents or newspaper coverage</li>
+              <li>Connecting related legislation,court cases or historical events</li>
+              <li>Clarifying legal or constitutional concepts in plain language</li>
             </ul>
             <p className="mt-3 mb-0">What would you like to explore?</p>
           </div>
@@ -222,7 +210,7 @@ function ChatBody({ currentLanguage }) {
             />
           </div>
           <p className="font-['Inter:Semi_Bold',sans-serif] font-semibold text-[16px] text-white">
-            Histora AI Chatbot
+            Cultural Heritage Chatbot
           </p>
         </div>
 
