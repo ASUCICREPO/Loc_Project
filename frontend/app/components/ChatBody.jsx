@@ -18,9 +18,22 @@ function ChatBody({ currentLanguage }) {
             <br />
             <br />
           </p>
-          <p className="mb-0">I'm here to help you dive deeper into the content on this page.</p>
-          <p className="mb-0">To tailor the experience to your learning style, could you tell me your role?</p>
+          <p className="mb-0">You can discover more about the formation of the United States during the American Revolution through:</p>
+          <ul className="list-disc ml-5 mt-2 mb-3">
+            <li>Constitutional history and amendments</li>
+            <li>Congressional bills and legislation</li>
+            <li>Historical newspapers and documents</li>
+            <li>Legal precedents and court cases</li>
+          </ul>
+          <p className="mb-0">To tailor the experience to your learning style, please select a persona:</p>
           <p className="mb-0">&nbsp;</p>
+          <p className="font-semibold mb-2">Persona descriptions:</p>
+          <div className="ml-4 mb-3 space-y-2">
+            <p className="mb-0"><strong>1. Interested Person</strong> - I'll tell you all that I know based on my training with a special set of curated historical materials.</p>
+            <p className="mb-0"><strong>2. Policy Analyst</strong> - I'll focus more on the historical precedents and constitutional interpretations.</p>
+            <p className="mb-0"><strong>3. Research Journalist</strong> - I'll give you historical and cultural context in a tone more suited for the news.</p>
+            <p className="mb-0"><strong>4. Law Student</strong> - I'll give you responses with precise legal terminology, referencing cases and legal reasoning found in the special set of historical documents I was trained on.</p>
+          </div>
           <p className="font-semibold">Please select one to get started:</p>
         </div>
       ),
@@ -50,8 +63,8 @@ function ChatBody({ currentLanguage }) {
 
   // Define personas
   const personas = {
-    'general': 'General User',
-    'congressional_staffer': 'Congressional Staffer', 
+    'interested_person': 'Interested Person',
+    'policy_analyst': 'Policy Analyst',
     'research_journalist': 'Research Journalist',
     'law_student': 'Law Student'
   }
@@ -71,7 +84,7 @@ function ChatBody({ currentLanguage }) {
 
   const handlePersonaSelection = (persona) => {
     setSelectedPersona(persona)
-    
+
     const userMessage = {
       id: Date.now().toString(),
       type: 'user',
@@ -81,7 +94,7 @@ function ChatBody({ currentLanguage }) {
 
     setMessages(prev => [...prev, userMessage])
     setIsTyping(true)
-    
+
     setTimeout(() => {
       const botMessage = {
         id: (Date.now() + 1).toString(),
@@ -106,6 +119,27 @@ function ChatBody({ currentLanguage }) {
       setConversationState('persona-selected')
       setIsTyping(false)
     }, 800)
+  }
+
+  const handlePersonaChange = (newPersona) => {
+    if (newPersona === selectedPersona) return
+
+    setSelectedPersona(newPersona)
+
+    const notificationMessage = {
+      id: Date.now().toString(),
+      type: 'bot',
+      content: (
+        <div>
+          <p className="mb-0">
+            <span className="italic">Persona switched to <strong>{personas[newPersona]}</strong></span>
+          </p>
+        </div>
+      ),
+      timestamp: new Date()
+    }
+
+    setMessages(prev => [...prev, notificationMessage])
   }
 
   const handleSendMessage = async (messageText = null) => {
@@ -175,12 +209,12 @@ function ChatBody({ currentLanguage }) {
   return (
     <div className="bg-[#f4eee5] flex flex-col fixed inset-0 z-50 w-screen h-screen">
       {/* Header */}
-      <div className="bg-[#28333a] flex h-[60px] items-center leading-[0] px-[32px] py-[10px] shrink-0">
+      <div className="bg-[#28333a] flex h-[60px] items-center justify-between leading-[0] px-[32px] py-[10px] shrink-0">
         <div className="flex items-center gap-3">
           <div className="w-[48px] h-[48px] bg-white rounded-full flex items-center justify-center overflow-hidden p-1">
-            <Image 
-              src="/logo.png" 
-              alt="Historical Figure Avatar" 
+            <Image
+              src="/logo.png"
+              alt="Historical Figure Avatar"
               width={32}
               height={32}
               className="w-full h-full object-cover rounded-full"
@@ -191,6 +225,35 @@ function ChatBody({ currentLanguage }) {
             Histora AI Chatbot
           </p>
         </div>
+
+        {/* Persona Dropdown - Only show after persona is selected */}
+        {selectedPersona && (
+          <div className="flex items-center gap-2">
+            <label className="text-white text-[14px] font-['Inter:Regular',sans-serif]">
+              Persona:
+            </label>
+            <select
+              value={selectedPersona}
+              onChange={(e) => handlePersonaChange(e.target.value)}
+              className="bg-white text-black text-[14px] font-['Inter:Regular',sans-serif] px-3 py-1.5 rounded-md border border-[rgba(255,255,255,0.3)] outline-none hover:bg-gray-100 focus:bg-gray-100 focus:border-gray-400 cursor-pointer transition-colors"
+              style={{
+                WebkitAppearance: 'none',
+                MozAppearance: 'none',
+                appearance: 'none',
+                backgroundImage: `url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`,
+                backgroundRepeat: 'no-repeat',
+                backgroundPosition: 'right 0.75rem center',
+                paddingRight: '2.5rem'
+              }}
+            >
+              {Object.entries(personas).map(([key, value]) => (
+                <option key={key} value={key} className="bg-white text-black">
+                  {value}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {/* Chat Messages */}
