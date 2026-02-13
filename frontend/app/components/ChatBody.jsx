@@ -226,34 +226,42 @@ function ChatBody({ currentLanguage }) {
           </p>
         </div>
 
-        {/* Persona Dropdown - Only show after persona is selected */}
-        {selectedPersona && (
-          <div className="flex items-center gap-2">
-            <label className="text-white text-[14px] font-['Inter:Regular',sans-serif]">
-              Persona:
-            </label>
-            <select
-              value={selectedPersona}
-              onChange={(e) => handlePersonaChange(e.target.value)}
-              className="bg-white text-black text-[14px] font-['Inter:Regular',sans-serif] px-3 py-1.5 rounded-md border border-[rgba(255,255,255,0.3)] outline-none hover:bg-gray-100 focus:bg-gray-100 focus:border-gray-400 cursor-pointer transition-colors"
-              style={{
-                WebkitAppearance: 'none',
-                MozAppearance: 'none',
-                appearance: 'none',
-                backgroundImage: `url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`,
-                backgroundRepeat: 'no-repeat',
-                backgroundPosition: 'right 0.75rem center',
-                paddingRight: '2.5rem'
-              }}
-            >
-              {Object.entries(personas).map(([key, value]) => (
-                <option key={key} value={key} className="bg-white text-black">
-                  {value}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+        {/* Persona Dropdown */}
+        <div className="flex items-center gap-2">
+          <label className="text-white text-[14px] font-['Inter:Regular',sans-serif]">
+            Persona:
+          </label>
+          <select
+            value={selectedPersona}
+            onChange={(e) => {
+              const newPersona = e.target.value
+              if (newPersona && newPersona !== selectedPersona) {
+                if (selectedPersona) {
+                  handlePersonaChange(newPersona)
+                } else {
+                  handlePersonaSelection(newPersona)
+                }
+              }
+            }}
+            className="bg-white text-black text-[14px] font-['Inter:Regular',sans-serif] px-3 py-1.5 rounded-md border border-[rgba(255,255,255,0.3)] outline-none hover:bg-gray-100 focus:bg-gray-100 focus:border-gray-400 cursor-pointer transition-colors"
+            style={{
+              WebkitAppearance: 'none',
+              MozAppearance: 'none',
+              appearance: 'none',
+              backgroundImage: `url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1.5L6 6.5L11 1.5' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")`,
+              backgroundRepeat: 'no-repeat',
+              backgroundPosition: 'right 0.75rem center',
+              paddingRight: '2.5rem'
+            }}
+          >
+            {!selectedPersona && <option value="" className="bg-white text-black">Select a persona</option>}
+            {Object.entries(personas).map(([key, value]) => (
+              <option key={key} value={key} className="bg-white text-black">
+                {value}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       {/* Chat Messages */}
