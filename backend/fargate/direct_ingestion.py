@@ -298,7 +298,7 @@ if __name__ == '__main__':
     
     Environment Variables:
         KNOWLEDGE_BASE_ID - Required
-        BUCKET_NAME - Required (defaults to test-data-541064517181-us-east-1)
+        BUCKET_NAME - Required
     """
     import sys
     

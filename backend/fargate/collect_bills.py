@@ -20,7 +20,9 @@ from datasets import load_dataset
 from direct_ingestion import trigger_kb_sync_with_direct_ingestion
 
 # Configuration
-CONGRESS_API_KEY = os.environ.get('CONGRESS_API_KEY', 'MThtRT5WkFu8I8CHOfiLLebG4nsnKcX3JnNv2N8A')
+CONGRESS_API_KEY = os.environ.get('CONGRESS_API_KEY')
+if not CONGRESS_API_KEY:
+    raise ValueError("CONGRESS_API_KEY environment variable is required")
 BUCKET_NAME = os.environ.get('BUCKET_NAME')
 
 # Congress configuration

@@ -22,7 +22,8 @@ def lambda_handler(event, context):
         - dataSourceId (optional): ID of data source to sync
     Output: Ingestion job details
     """
-    print(f"Event: {json.dumps(event)}")
+    # Log request metadata only
+    print(f"KB sync trigger invoked for KB: {KB_ID}")
     
     # Get data source to sync (default to congress-bills)
     ds_name = event.get('dataSourceName', 'congress-bills')

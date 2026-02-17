@@ -25,10 +25,10 @@ def lambda_handler(event, context):
     Actual event structure from Knowledge Base:
     {
         "version": "1.0",
-        "bucketName": "loc-transformation-541064517181-us-east-1",
-        "knowledgeBaseId": "ULNF0JAYER",
-        "dataSourceId": "F8RGOJVWHT",
-        "ingestionJobId": "WC4RZUYTQU",
+        "bucketName": "<transformation-bucket>",
+        "knowledgeBaseId": "<kb-id>",
+        "dataSourceId": "<ds-id>",
+        "ingestionJobId": "<job-id>",
         "priorTask": "CHUNKING",
         "inputFiles": [
             {
@@ -40,7 +40,7 @@ def lambda_handler(event, context):
                 "originalFileLocation": {
                     "type": "S3",
                     "s3_location": {
-                        "uri": "s3://congress-bills-data-541064517181-us-east-1/extracted/congress_11/hr_39.txt"
+                        "uri": "s3://<data-bucket>/extracted/congress_11/hr_39.txt"
                     }
                 }
             }

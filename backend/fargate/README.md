@@ -183,12 +183,12 @@ cd backend/fargate
 # Build image
 docker build -t collector-test .
 
-# Run locally
+# Run locally (use AWS credentials from environment or IAM role)
 docker run -e BUCKET_NAME=test-bucket \
   -e START_CONGRESS=1 \
   -e END_CONGRESS=2 \
   -e BILL_TYPES=hr \
-  -e AWS_ACCESS_KEY_ID=xxx \
-  -e AWS_SECRET_ACCESS_KEY=xxx \
+  -e CONGRESS_API_KEY=$CONGRESS_API_KEY \
+  -e AWS_REGION=$AWS_REGION \
   collector-test
 ```

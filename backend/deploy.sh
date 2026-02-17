@@ -16,7 +16,7 @@ clean_url=${clean_url%/}
 
 # Get project name
 if [ -z "${PROJECT_NAME:-}" ]; then
-  read -rp "Enter project name [default: chronicling-america-pipeline]: " PROJECT_NAME
+  read -rp "Enter project name [default: loc]: " PROJECT_NAME
   PROJECT_NAME=${PROJECT_NAME:-loc}
 fi
 
@@ -37,8 +37,17 @@ fi
 
 # Get Bedrock model ID
 if [ -z "${BEDROCK_MODEL_ID:-}" ]; then
-  read -rp "Enter Bedrock model ID [default: anthropic.claude-3-5-sonnet-20241022-v2:0]: " BEDROCK_MODEL_ID
-  BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-anthropic.claude-3-5-sonnet-20241022-v2:0}
+  read -rp "Enter Bedrock model ID [default: global.anthropic.claude-sonnet-4-5-20250929-v1:0]: " BEDROCK_MODEL_ID
+  BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-global.anthropic.claude-sonnet-4-5-20250929-v1:0}
+fi
+
+# Get Congress.gov API key
+if [ -z "${CONGRESS_API_KEY:-}" ]; then
+  read -rp "Enter Congress.gov API key (get one at https://api.congress.gov/sign-up): " CONGRESS_API_KEY
+  if [ -z "$CONGRESS_API_KEY" ]; then
+    echo "Error: Congress.gov API key is required"
+    exit 1
+  fi
 fi
 
 # Get action
@@ -96,7 +105,8 @@ ENV_VARS=$(cat <<EOF
   {"name": "ACTION", "value": "$ACTION", "type": "PLAINTEXT"},
   {"name": "CDK_DEFAULT_REGION", "value": "$AWS_REGION", "type": "PLAINTEXT"},
   {"name": "DATA_BUCKET_NAME", "value": "$DATA_BUCKET_NAME", "type": "PLAINTEXT"},
-  {"name": "BEDROCK_MODEL_ID", "value": "$BEDROCK_MODEL_ID", "type": "PLAINTEXT"}
+  {"name": "BEDROCK_MODEL_ID", "value": "$BEDROCK_MODEL_ID", "type": "PLAINTEXT"},
+  {"name": "CONGRESS_API_KEY", "value": "$CONGRESS_API_KEY", "type": "PLAINTEXT"}
 ]
 EOF
 )
@@ -172,6 +182,7 @@ echo "GitHub URL: $GITHUB_URL"
 echo "AWS Region: $AWS_REGION"
 echo "Data Bucket: $DATA_BUCKET_NAME"
 echo "Bedrock Model: $BEDROCK_MODEL_ID"
+echo "Congress API Key: ****${CONGRESS_API_KEY: -4}"
 echo "Action: $ACTION"
 echo "Build ID: $BUILD_ID"
 echo ""

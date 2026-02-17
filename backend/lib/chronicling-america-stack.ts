@@ -17,17 +17,18 @@ import * as path from "path";
 import { bedrock as bedrockConstructs } from "@cdklabs/generative-ai-cdk-constructs";
 import { ContextEnrichment } from "@cdklabs/generative-ai-cdk-constructs/lib/cdk-lib/bedrock";
 
-export interface ChroniclingAmericaStackProps extends cdk.StackProps {
+export interface LOCStackProps extends cdk.StackProps {
   projectName: string;
   dataBucketName?: string;
   bedrockModelId?: string;
+  congressApiKey: string;
 }
 
-export class ChroniclingAmericaStack extends cdk.Stack {
+export class LOCStack extends cdk.Stack {
   constructor(
     scope: Construct,
     id: string,
-    props: ChroniclingAmericaStackProps
+    props: LOCStackProps
   ) {
     super(scope, id, props);
 
@@ -37,6 +38,7 @@ export class ChroniclingAmericaStack extends cdk.Stack {
     // Foundation model: "anthropic.claude-3-5-sonnet-20241022-v2:0"
     const bedrockModelId =
       props.bedrockModelId || "anthropic.claude-3-5-sonnet-20241022-v2:0";
+    const congressApiKey = props.congressApiKey;
 
     // ========================================
     // S3 Buckets for Data Storage
@@ -286,7 +288,7 @@ export class ChroniclingAmericaStack extends cdk.Stack {
         START_CONGRESS: "1",
         END_CONGRESS: "16",
         BILL_TYPES: "hr,s,hjres,sjres,hconres,sconres,hres,sres",
-        CONGRESS_API_KEY: "MThtRT5WkFu8I8CHOfiLLebG4nsnKcX3JnNv2N8A",
+        CONGRESS_API_KEY: congressApiKey,
         // Hugging Face Dataset Configuration for Newspapers
         HUGGINGFACE_DATASET: "RevolutionCrossroads/loc_chronicling_america_1770-1810",
         MAX_NEWSPAPER_PAGES: "0",  // 0 = process ALL newspapers (auto-creates batches of 25k)
