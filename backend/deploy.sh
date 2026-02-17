@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "========================================="
-echo "Chronicling America Pipeline Deployment"
+echo "LOC Pipeline Deployment"
 echo "========================================="
 echo ""
 
