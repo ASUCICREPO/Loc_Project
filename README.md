@@ -62,7 +62,7 @@ The Cultural Heritage Chatbot provides an intelligent, persona-based interface f
 
 ## Architecture Diagram
 
-![Architecture Diagram](./docs/ArchitectureDiagram.png)
+![Architecture Diagram](./docs/ArchitechtureDiagram.png)
 
 The application implements a serverless architecture on AWS, combining:
 
