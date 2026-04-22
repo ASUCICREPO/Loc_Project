@@ -1,6 +1,6 @@
 # Cultural Heritage Chatbot - Library of Congress
 
-An AI-powered conversational interface designed to help users explore historical documents from America's founding era, including Constitutional history, Congressional legislation, historical newspapers, and legal precedents.
+An AI-powered conversational interface designed to help users explore historical documents from America's founding era, including historical Constitutional materials, Congressional legislation, historical newspapers, and related legal materials. For questions about this experiment, please contact digitalstrategy@loc.gov or visit https://www.loc.gov/digital-strategy
 
 ## Disclaimers
 
@@ -14,7 +14,9 @@ This document:
 
 (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. The responsibilities and liabilities of AWS to its customers are controlled by AWS agreements, and this document is not part of, nor does it modify, any agreement between AWS and its customers, and
 
-(d) is not to be considered a recommendation or viewpoint of AWS.
+(d) is not to be considered a recommendation, viewpoint of AWS or the Library of Congress.
+
+(e) is an experiment to demonstrate the possibilities for the use of these services with cultural heritage materials.
 
 Additionally, you are solely responsible for testing, security and optimizing all code and assets on GitHub repo, and all such code and assets should be considered:
 
@@ -40,7 +42,7 @@ All work produced is open source. More information can be found in the GitHub re
 
 ## Overview
 
-The Cultural Heritage Chatbot provides an intelligent, persona-based interface for accessing and understanding historical documents from the Library of Congress collections. Users can interact with the chatbot using different personas tailored to their expertise level and information needs.
+The Cultural Heritage Chatbot provides an intelligent, persona-based interface for accessing and understanding historical documents from a selection of materials from the Library of Congress. Users can interact with the chatbot using different personas tailored to their expertise level and information needs.
 
 ### Key Features
 
